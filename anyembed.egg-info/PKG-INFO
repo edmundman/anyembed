@@ -1,3 +1,20 @@
+Metadata-Version: 2.4
+Name: anyembed
+Version: 0.1.0
+Summary: Embed anything (text, images, audio, video) with e5-omni-7B and search it locally
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.3
+Requires-Dist: transformers>=4.52.0
+Requires-Dist: accelerate>=0.34
+Requires-Dist: qwen-omni-utils[decord]
+Requires-Dist: pillow
+Requires-Dist: soundfile
+Requires-Dist: librosa
+Requires-Dist: chromadb>=0.5
+Requires-Dist: numpy
+Requires-Dist: textual>=0.80
+
 # anyembed
 
 Embed **anything** — text, images, audio, or video — into one shared embedding

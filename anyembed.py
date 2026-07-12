@@ -338,9 +338,11 @@ def find_similar(query: Any, top_k: int = 5, **kwargs) -> list[dict]:
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="anyembed", description="Embed anything and search for similar items."
+        prog="anyembed",
+        description="Embed anything and search for similar items. "
+        "Run with no arguments to launch the interactive TUI.",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     p_add = sub.add_parser("add", help="Embed and store one or more items")
     p_add.add_argument("items", nargs="+", help="Text, file paths, folders, or URLs")
@@ -354,7 +356,16 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_search.add_argument("query", help="Text, file path, or URL")
     p_search.add_argument("-k", "--top-k", type=int, default=5)
 
+    sub.add_parser("tui", help="Launch the interactive TUI (default)")
+
     args = parser.parse_args(argv)
+
+    if args.command in (None, "tui"):
+        from anyembed_tui import AnyEmbedTUI
+
+        AnyEmbedTUI().run()
+        return
+
     db = _get_default_db()
 
     if args.command == "add":
