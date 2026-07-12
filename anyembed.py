@@ -133,8 +133,19 @@ class E5OmniEmbedder:
         self._torch = torch
         self.use_audio_in_video = use_audio_in_video
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        if device.startswith("cuda"):
+            dtype = torch.bfloat16
+        elif device.startswith("mps"):
+            # bfloat16 on MPS is flaky on older macOS/torch; float16 is safe
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
 
         self.processor = Qwen2_5OmniProcessor.from_pretrained(model_name)
         self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(

@@ -31,7 +31,9 @@ and run `python anyembed.py ...` directly.)
 
 Notes:
 - The model is ~7B parameters; a GPU with ≥16 GB VRAM (bfloat16) is
-  recommended. CPU works but is slow.
+  recommended. On Apple Silicon it runs on MPS in float16 (≥24 GB unified
+  memory recommended). CPU works but is slow. Devices are auto-detected
+  (cuda → mps → cpu); override with `E5OmniEmbedder(device="cpu")`.
 - Video/audio decoding needs `ffmpeg` available on your system.
 
 ## Usage
