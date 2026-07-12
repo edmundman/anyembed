@@ -264,12 +264,14 @@ class AnyEmbedDB:
         recursive: bool = True,
         metadata: Optional[dict] = None,
         on_error: str = "warn",
+        verbose: bool = False,
     ) -> dict[str, str]:
         """Embed and store every embeddable file in *folder*.
 
         Images, audio, and video are embedded directly; `.txt`/`.md` files
         have their contents embedded as text. Returns {path: record_id}.
         Failures are skipped with a warning unless ``on_error="raise"``.
+        Pass ``verbose=True`` to see full tracebacks.
         """
         results: dict[str, str] = {}
         for path in iter_embeddable_files(folder, recursive=recursive):
@@ -286,6 +288,10 @@ class AnyEmbedDB:
             except Exception as exc:
                 if on_error == "raise":
                     raise
+                if verbose:
+                    import traceback
+
+                    traceback.print_exc()
                 print(f"anyembed: skipping {path}: {exc}")
         return results
 
@@ -362,6 +368,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         action="store_true",
         help="When adding a folder, don't descend into subfolders",
     )
+    p_add.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show full tracebacks when files fail",
+    )
 
     p_search = sub.add_parser("search", help="Find items similar to a query")
     p_search.add_argument("query", help="Text, file path, or URL")
@@ -382,7 +394,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.command == "add":
         for item in args.items:
             if os.path.isdir(item):
-                results = db.add_folder(item, recursive=not args.no_recursive)
+                results = db.add_folder(
+                    item,
+                    recursive=not args.no_recursive,
+                    verbose=args.verbose if hasattr(args, "verbose") else False,
+                )
                 for path, id in results.items():
                     print(f"added [{detect_modality(path)}] {path} -> {id}")
                 print(f"added {len(results)} files from {item}")
