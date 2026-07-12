@@ -126,7 +126,7 @@ class E5OmniEmbedder:
     ):
         import torch
         from transformers import (
-            Qwen2_5OmniProcessor,
+            AutoProcessor,
             Qwen2_5OmniThinkerForConditionalGeneration,
         )
 
@@ -147,11 +147,15 @@ class E5OmniEmbedder:
         else:
             dtype = torch.float32
 
-        self.processor = Qwen2_5OmniProcessor.from_pretrained(model_name)
+        # AutoProcessor is more forgiving than Qwen2_5OmniProcessor for variant models
+        self.processor = AutoProcessor.from_pretrained(
+            model_name, trust_remote_code=True
+        )
         self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=dtype,
             device_map=device,
+            trust_remote_code=True,
         )
         self.model.eval()
 
