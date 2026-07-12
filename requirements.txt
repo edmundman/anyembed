@@ -10,4 +10,7 @@ librosa
 # Local vector database
 chromadb>=0.5
 
+# Terminal UI
+textual>=0.80
+
 numpy

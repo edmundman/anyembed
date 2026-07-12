@@ -23,8 +23,11 @@ audio clips with a text query, or your photos with another photo).
 ## Install
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
+
+This gives you an `anyembed` command. (Or `pip install -r requirements.txt`
+and run `python anyembed.py ...` directly.)
 
 Notes:
 - The model is ~7B parameters; a GPU with ≥16 GB VRAM (bfloat16) is
@@ -78,11 +81,20 @@ db.search("fluffy dog", top_k=5, where={"modality": "image"})
 ### CLI
 
 ```bash
-python anyembed.py add photos/dog.jpg clips/bark.wav "a dog barking"
-python anyembed.py add ~/Pictures/pets            # whole folder (recursive)
-python anyembed.py add notes/ --no-recursive
-python anyembed.py search "dog playing" -k 5
+anyembed add photos/dog.jpg clips/bark.wav "a dog barking"
+anyembed add ~/Pictures/pets            # whole folder (recursive)
+anyembed add notes/ --no-recursive
+anyembed search "dog playing" -k 5
 ```
+
+### TUI
+
+Run `anyembed` with no arguments (or `anyembed tui`) for a little
+interactive terminal UI: type text or a file/folder path in the box, press
+**Enter** to search, **Ctrl+A** to embed & add it to the DB, **Ctrl+Q** to
+quit. Results show up in a table with similarity scores and modality.
+Embedding runs in a background thread, so the UI stays responsive while
+the model loads.
 
 ## Tests
 
