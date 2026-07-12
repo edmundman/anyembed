@@ -1,8 +1,10 @@
 # Model + preprocessing
 torch>=2.3
+torchvision                 # video frame decoding backend for qwen-omni-utils
 transformers>=4.52.0        # Qwen2.5-Omni support
 accelerate>=0.34
-qwen-omni-utils[decord]     # converts image/audio/video inputs for Qwen2.5-Omni models
+qwen-omni-utils             # converts image/audio/video inputs for Qwen2.5-Omni models
+                            # (optionally: pip install decord on Linux for faster video decoding)
 pillow
 soundfile
 librosa
