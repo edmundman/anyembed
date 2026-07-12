@@ -88,7 +88,8 @@ def iter_embeddable_files(folder, recursive: bool = True) -> list[str]:
     """Return sorted paths of all embeddable files in *folder*.
 
     Includes images, audio, video, and plain-text files (see
-    EMBEDDABLE_EXTS); everything else is skipped.
+    EMBEDDABLE_EXTS); everything else is skipped, as are hidden files and
+    directories (names starting with ".", e.g. Syncthing's .stfolder).
     """
     folder = os.path.expanduser(os.fspath(folder))
     if not os.path.isdir(folder):
@@ -96,17 +97,34 @@ def iter_embeddable_files(folder, recursive: bool = True) -> list[str]:
 
     paths = []
     if recursive:
-        for root, _dirs, files in os.walk(folder):
-            paths.extend(os.path.join(root, f) for f in files)
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            paths.extend(os.path.join(root, f) for f in files if not f.startswith("."))
     else:
         paths = [
             os.path.join(folder, f)
             for f in os.listdir(folder)
-            if os.path.isfile(os.path.join(folder, f))
+            if not f.startswith(".") and os.path.isfile(os.path.join(folder, f))
         ]
     return sorted(
         p for p in paths if os.path.splitext(p)[1].lower() in EMBEDDABLE_EXTS
     )
+
+
+def _resolve_model_dir(model_name: str) -> str:
+    """Download the full model repo once (cached) and return its local path.
+
+    Loading from a local directory makes transformers glob the actual files
+    on disk instead of resolving them one-by-one against the Hub — which
+    avoids a transformers bug where additional_chat_templates files listed
+    by the Hub API resolve to None and crash processor loading
+    ("expected str, bytes or os.PathLike object, not NoneType").
+    """
+    if os.path.isdir(model_name):
+        return model_name
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(model_name)
 
 
 class E5OmniEmbedder:
@@ -147,12 +165,13 @@ class E5OmniEmbedder:
         else:
             dtype = torch.float32
 
-        # AutoProcessor is more forgiving than Qwen2_5OmniProcessor for variant models
+        # Download the repo up front and load from disk (see _resolve_model_dir).
+        model_path = _resolve_model_dir(model_name)
         self.processor = AutoProcessor.from_pretrained(
-            model_name, trust_remote_code=True
+            model_path, trust_remote_code=True
         )
         self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-            model_name,
+            model_path,
             torch_dtype=dtype,
             device_map=device,
             trust_remote_code=True,

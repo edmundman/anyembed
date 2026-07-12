@@ -92,6 +92,13 @@ class TestIterEmbeddableFiles(unittest.TestCase):
         with self.assertRaises(NotADirectoryError):
             iter_embeddable_files(self._touch("a.jpg"))
 
+    def test_skips_hidden_files_and_dirs(self):
+        kept = self._touch("song.mp3")
+        self._touch(".hidden.mp3")
+        self._touch(".stfolder/syncthing-folder-123.txt")
+        self._touch(".git/objects/a.png")
+        self.assertEqual(iter_embeddable_files(self.root), [kept])
+
 
 if __name__ == "__main__":
     unittest.main()
