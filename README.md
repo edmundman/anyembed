@@ -50,6 +50,21 @@ for hit in find_similar("dog playing outside", top_k=3):
 find_similar("photos/other_dog.jpg", top_k=3)
 ```
 
+### Ingest a whole folder
+
+```python
+from anyembed import embed_folder
+
+# Recursively embeds every image/audio/video file, plus the contents of
+# .txt/.md files; other file types are skipped. Returns {path: record_id}.
+embed_folder("~/Pictures/pets")
+embed_folder("notes/", recursive=False)
+```
+
+Files that fail to decode are skipped with a warning (pass
+`on_error="raise"` to stop instead), and re-running on the same folder
+upserts rather than duplicating.
+
 For more control (custom DB path, collection name, instructions, filters):
 
 ```python
@@ -64,6 +79,8 @@ db.search("fluffy dog", top_k=5, where={"modality": "image"})
 
 ```bash
 python anyembed.py add photos/dog.jpg clips/bark.wav "a dog barking"
+python anyembed.py add ~/Pictures/pets            # whole folder (recursive)
+python anyembed.py add notes/ --no-recursive
 python anyembed.py search "dog playing" -k 5
 ```
 

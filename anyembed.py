@@ -36,6 +36,9 @@ DEFAULT_COLLECTION = "anyembed"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg", ".m4v"}
+# Plain-text files whose *contents* are embedded when ingesting a folder.
+TEXT_FILE_EXTS = {".txt", ".md"}
+EMBEDDABLE_EXTS = IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS | TEXT_FILE_EXTS
 
 # Default instruction appended to each input; e5-omni is instruction-tuned, so
 # a short task description helps align modalities. Tweak per your task.
@@ -79,6 +82,31 @@ def detect_modality(item: Any) -> str:
         if ext in VIDEO_EXTS:
             return "video"
     return "text"
+
+
+def iter_embeddable_files(folder, recursive: bool = True) -> list[str]:
+    """Return sorted paths of all embeddable files in *folder*.
+
+    Includes images, audio, video, and plain-text files (see
+    EMBEDDABLE_EXTS); everything else is skipped.
+    """
+    folder = os.path.expanduser(os.fspath(folder))
+    if not os.path.isdir(folder):
+        raise NotADirectoryError(f"Not a folder: {folder}")
+
+    paths = []
+    if recursive:
+        for root, _dirs, files in os.walk(folder):
+            paths.extend(os.path.join(root, f) for f in files)
+    else:
+        paths = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if os.path.isfile(os.path.join(folder, f))
+        ]
+    return sorted(
+        p for p in paths if os.path.splitext(p)[1].lower() in EMBEDDABLE_EXTS
+    )
 
 
 class E5OmniEmbedder:
@@ -219,6 +247,37 @@ class AnyEmbedDB:
         )
         return id
 
+    def add_folder(
+        self,
+        folder,
+        recursive: bool = True,
+        metadata: Optional[dict] = None,
+        on_error: str = "warn",
+    ) -> dict[str, str]:
+        """Embed and store every embeddable file in *folder*.
+
+        Images, audio, and video are embedded directly; `.txt`/`.md` files
+        have their contents embedded as text. Returns {path: record_id}.
+        Failures are skipped with a warning unless ``on_error="raise"``.
+        """
+        results: dict[str, str] = {}
+        for path in iter_embeddable_files(folder, recursive=recursive):
+            try:
+                file_meta = dict(metadata or {})
+                if os.path.splitext(path)[1].lower() in TEXT_FILE_EXTS:
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                    file_meta["source"] = path
+                    id = hashlib.sha1(f"text:{path}".encode()).hexdigest()[:16]
+                    results[path] = self.add(content, id=id, metadata=file_meta)
+                else:
+                    results[path] = self.add(path, metadata=file_meta)
+            except Exception as exc:
+                if on_error == "raise":
+                    raise
+                print(f"anyembed: skipping {path}: {exc}")
+        return results
+
     def search(
         self,
         query: Any,
@@ -267,6 +326,11 @@ def embed_anything(item: Any, metadata: Optional[dict] = None, **kwargs) -> str:
     return _get_default_db().add(item, metadata=metadata, **kwargs)
 
 
+def embed_folder(folder, recursive: bool = True, **kwargs) -> dict[str, str]:
+    """Embed and store every embeddable file in a folder. Returns {path: id}."""
+    return _get_default_db().add_folder(folder, recursive=recursive, **kwargs)
+
+
 def find_similar(query: Any, top_k: int = 5, **kwargs) -> list[dict]:
     """Search the local DB for items similar to *query* (any modality)."""
     return _get_default_db().search(query, top_k=top_k, **kwargs)
@@ -279,7 +343,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_add = sub.add_parser("add", help="Embed and store one or more items")
-    p_add.add_argument("items", nargs="+", help="Text, file paths, or URLs")
+    p_add.add_argument("items", nargs="+", help="Text, file paths, folders, or URLs")
+    p_add.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="When adding a folder, don't descend into subfolders",
+    )
 
     p_search = sub.add_parser("search", help="Find items similar to a query")
     p_search.add_argument("query", help="Text, file path, or URL")
@@ -290,8 +359,14 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if args.command == "add":
         for item in args.items:
-            id = db.add(item)
-            print(f"added [{detect_modality(item)}] {item} -> {id}")
+            if os.path.isdir(item):
+                results = db.add_folder(item, recursive=not args.no_recursive)
+                for path, id in results.items():
+                    print(f"added [{detect_modality(path)}] {path} -> {id}")
+                print(f"added {len(results)} files from {item}")
+            else:
+                id = db.add(item)
+                print(f"added [{detect_modality(item)}] {item} -> {id}")
     elif args.command == "search":
         for hit in db.search(args.query, top_k=args.top_k):
             meta = hit["metadata"]

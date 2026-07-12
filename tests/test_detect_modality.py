@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from anyembed import detect_modality
+from anyembed import detect_modality, iter_embeddable_files
 
 
 class TestDetectModality(unittest.TestCase):
@@ -53,6 +53,44 @@ class TestDetectModality(unittest.TestCase):
     def test_rejects_non_string(self):
         with self.assertRaises(TypeError):
             detect_modality(42)
+
+
+class TestIterEmbeddableFiles(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = self._dir.name
+
+    def _touch(self, relpath: str) -> str:
+        path = os.path.join(self.root, relpath)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"\x00")
+        return path
+
+    def test_collects_media_and_text_skips_others(self):
+        keep = {
+            self._touch("a.jpg"),
+            self._touch("b.wav"),
+            self._touch("c.mp4"),
+            self._touch("d.txt"),
+            self._touch("e.md"),
+        }
+        self._touch("skip.py")
+        self._touch("skip.bin")
+        self.assertEqual(set(iter_embeddable_files(self.root)), keep)
+
+    def test_recursive_and_flat(self):
+        top = self._touch("top.png")
+        nested = self._touch("sub/deep/nested.mp3")
+        self.assertEqual(set(iter_embeddable_files(self.root)), {top, nested})
+        self.assertEqual(
+            iter_embeddable_files(self.root, recursive=False), [top]
+        )
+
+    def test_not_a_folder(self):
+        with self.assertRaises(NotADirectoryError):
+            iter_embeddable_files(self._touch("a.jpg"))
 
 
 if __name__ == "__main__":
