@@ -170,12 +170,26 @@ class E5OmniEmbedder:
         self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=True
         )
+        # device_map (accelerate) pre-allocates all weights as ONE buffer per
+        # device; Metal caps single-buffer sizes, so on MPS that fails with
+        # "Invalid buffer size". Only use device_map on CUDA — elsewhere load
+        # normally and move the model tensor-by-tensor with .to().
+        load_kwargs = {"dtype": dtype, "trust_remote_code": True}
+        if device.startswith("cuda"):
+            load_kwargs["device_map"] = device
         self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            device_map=device,
-            trust_remote_code=True,
+            model_path, **load_kwargs
         )
+        if not device.startswith("cuda"):
+            try:
+                self.model = self.model.to(device)
+            except RuntimeError as exc:
+                if not device.startswith("mps"):
+                    raise
+                print(f"anyembed: model doesn't fit on MPS ({exc}); using CPU")
+                device = "cpu"
+                self.model = self.model.to("cpu", torch.float32)
+        self.device = device
         self.model.eval()
 
     def _build_conversation(self, item: Any, modality: str, instruction: str) -> list:
@@ -296,6 +310,10 @@ class AnyEmbedDB:
         Failures are skipped with a warning unless ``on_error="raise"``.
         Pass ``verbose=True`` to see full tracebacks.
         """
+        # Load the model once up front: if it can't load, abort the whole run
+        # instead of re-attempting (and re-failing) for every single file.
+        _ = self.embedder
+
         results: dict[str, str] = {}
         for path in iter_embeddable_files(folder, recursive=recursive):
             try:
