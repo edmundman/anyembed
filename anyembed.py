@@ -1,0 +1,302 @@
+"""anyembed - embed anything (text, images, audio, video) into one shared vector space.
+
+Uses the omni-modal embedding model `Haon-Chen/e5-omni-7B` (built on
+Qwen2.5-Omni-7B) to map every modality into the same embedding space, and
+stores the vectors in a local, persistent ChromaDB collection so you can
+query for similar items across modalities.
+
+Quick start::
+
+    from anyembed import embed_anything, find_similar
+
+    embed_anything("a photo of my dog playing fetch")   # text
+    embed_anything("photos/dog.jpg")                    # image
+    embed_anything("clips/bark.wav")                    # audio
+    embed_anything("videos/fetch.mp4")                  # video
+
+    for hit in find_similar("dog playing", top_k=3):
+        print(hit["similarity"], hit["document"])
+
+Heavy dependencies (torch, transformers, chromadb, ...) are imported lazily,
+so importing this module is cheap and modality detection works without them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import time
+from typing import Any, Optional
+
+MODEL_NAME = "Haon-Chen/e5-omni-7B"
+DEFAULT_DB_PATH = "./anyembed_db"
+DEFAULT_COLLECTION = "anyembed"
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg", ".m4v"}
+
+# Default instruction appended to each input; e5-omni is instruction-tuned, so
+# a short task description helps align modalities. Tweak per your task.
+DEFAULT_INSTRUCTIONS = {
+    "text": "Represent this text for retrieving similar content.",
+    "image": "Represent this image for retrieving similar content.",
+    "audio": "Represent this audio for retrieving similar content.",
+    "video": "Represent this video for retrieving similar content.",
+}
+
+
+def detect_modality(item: Any) -> str:
+    """Return one of "text" | "image" | "audio" | "video" for *item*.
+
+    Accepts a PIL image, a local file path, an http(s)/file URL, or any
+    other string (treated as text to embed directly).
+    """
+    try:
+        from PIL import Image
+
+        if isinstance(item, Image.Image):
+            return "image"
+    except ImportError:
+        pass
+
+    if isinstance(item, os.PathLike):
+        item = os.fspath(item)
+    if not isinstance(item, str):
+        raise TypeError(
+            f"Cannot embed object of type {type(item).__name__}; "
+            "pass text, a file path/URL, or a PIL image."
+        )
+
+    is_url = item.startswith(("http://", "https://", "file://"))
+    if is_url or os.path.exists(item):
+        ext = os.path.splitext(item.split("?", 1)[0])[1].lower()
+        if ext in IMAGE_EXTS:
+            return "image"
+        if ext in AUDIO_EXTS:
+            return "audio"
+        if ext in VIDEO_EXTS:
+            return "video"
+    return "text"
+
+
+class E5OmniEmbedder:
+    """Wraps Haon-Chen/e5-omni-7B for single-call, any-modality embedding.
+
+    The model is Qwen2.5-Omni's "thinker" fine-tuned for embeddings: inputs
+    are rendered through the chat template, run through the model, and the
+    hidden state of the final token is used as the embedding (L2-normalized,
+    3584-dimensional).
+    """
+
+    def __init__(
+        self,
+        model_name: str = MODEL_NAME,
+        device: Optional[str] = None,
+        use_audio_in_video: bool = False,
+    ):
+        import torch
+        from transformers import (
+            Qwen2_5OmniProcessor,
+            Qwen2_5OmniThinkerForConditionalGeneration,
+        )
+
+        self._torch = torch
+        self.use_audio_in_video = use_audio_in_video
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+        self.processor = Qwen2_5OmniProcessor.from_pretrained(model_name)
+        self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            device_map=device,
+        )
+        self.model.eval()
+
+    def _build_conversation(self, item: Any, modality: str, instruction: str) -> list:
+        content: list[dict] = []
+        if modality == "text":
+            content.append({"type": "text", "text": str(item)})
+        else:
+            # qwen_omni_utils accepts local paths, URLs, and PIL images here
+            # and handles decoding/resampling — this is the "convert into an
+            # embeddable format" step.
+            content.append({"type": modality, modality: item})
+        if instruction:
+            content.append({"type": "text", "text": instruction})
+        return [{"role": "user", "content": content}]
+
+    def embed(
+        self,
+        item: Any,
+        modality: Optional[str] = None,
+        instruction: Optional[str] = None,
+    ):
+        """Embed one item of any modality; returns a normalized 1-D numpy array."""
+        import torch
+        from qwen_omni_utils import process_mm_info
+
+        modality = modality or detect_modality(item)
+        if instruction is None:
+            instruction = DEFAULT_INSTRUCTIONS[modality]
+        conversation = self._build_conversation(item, modality, instruction)
+
+        text = self.processor.apply_chat_template(
+            conversation, add_generation_prompt=True, tokenize=False
+        )
+        audios, images, videos = process_mm_info(
+            conversation, use_audio_in_video=self.use_audio_in_video
+        )
+        inputs = self.processor(
+            text=text,
+            audio=audios,
+            images=images,
+            videos=videos,
+            return_tensors="pt",
+            padding=True,
+            use_audio_in_video=self.use_audio_in_video,
+        ).to(self.model.device)
+
+        with torch.no_grad():
+            outputs = self.model(
+                **inputs, output_hidden_states=True, return_dict=True
+            )
+        # Last-token pooling on the final hidden layer.
+        embedding = outputs.hidden_states[-1][0, -1]
+        embedding = torch.nn.functional.normalize(embedding, p=2, dim=-1)
+        return embedding.float().cpu().numpy()
+
+
+class AnyEmbedDB:
+    """A local, persistent vector store (ChromaDB) over an E5OmniEmbedder."""
+
+    def __init__(
+        self,
+        path: str = DEFAULT_DB_PATH,
+        collection: str = DEFAULT_COLLECTION,
+        embedder: Optional[E5OmniEmbedder] = None,
+    ):
+        import chromadb
+
+        self._embedder = embedder
+        self.client = chromadb.PersistentClient(path=path)
+        self.collection = self.client.get_or_create_collection(
+            collection, metadata={"hnsw:space": "cosine"}
+        )
+
+    @property
+    def embedder(self) -> E5OmniEmbedder:
+        if self._embedder is None:
+            self._embedder = E5OmniEmbedder()
+        return self._embedder
+
+    def add(
+        self,
+        item: Any,
+        id: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        instruction: Optional[str] = None,
+    ) -> str:
+        """Embed *item* and store it. Returns the record id."""
+        modality = detect_modality(item)
+        embedding = self.embedder.embed(item, modality=modality, instruction=instruction)
+
+        source = str(item) if isinstance(item, (str, os.PathLike)) else f"<{modality}>"
+        if id is None:
+            id = hashlib.sha1(f"{modality}:{source}".encode()).hexdigest()[:16]
+        record_meta = {"modality": modality, "source": source, "added_at": time.time()}
+        if metadata:
+            record_meta.update(metadata)
+
+        self.collection.upsert(
+            ids=[id],
+            embeddings=[embedding.tolist()],
+            metadatas=[record_meta],
+            documents=[source],
+        )
+        return id
+
+    def search(
+        self,
+        query: Any,
+        top_k: int = 5,
+        where: Optional[dict] = None,
+        instruction: Optional[str] = None,
+    ) -> list[dict]:
+        """Find stored items most similar to *query* (any modality).
+
+        Returns dicts with id, document, metadata, distance, and similarity
+        (cosine similarity, higher is more similar).
+        """
+        embedding = self.embedder.embed(query, instruction=instruction)
+        result = self.collection.query(
+            query_embeddings=[embedding.tolist()],
+            n_results=top_k,
+            where=where,
+        )
+        hits = []
+        for i, id in enumerate(result["ids"][0]):
+            distance = result["distances"][0][i]
+            hits.append(
+                {
+                    "id": id,
+                    "document": result["documents"][0][i],
+                    "metadata": result["metadatas"][0][i],
+                    "distance": distance,
+                    "similarity": 1.0 - distance,
+                }
+            )
+        return hits
+
+
+_default_db: Optional[AnyEmbedDB] = None
+
+
+def _get_default_db() -> AnyEmbedDB:
+    global _default_db
+    if _default_db is None:
+        _default_db = AnyEmbedDB()
+    return _default_db
+
+
+def embed_anything(item: Any, metadata: Optional[dict] = None, **kwargs) -> str:
+    """Embed any text / image / audio / video and store it in the local DB."""
+    return _get_default_db().add(item, metadata=metadata, **kwargs)
+
+
+def find_similar(query: Any, top_k: int = 5, **kwargs) -> list[dict]:
+    """Search the local DB for items similar to *query* (any modality)."""
+    return _get_default_db().search(query, top_k=top_k, **kwargs)
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="anyembed", description="Embed anything and search for similar items."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add", help="Embed and store one or more items")
+    p_add.add_argument("items", nargs="+", help="Text, file paths, or URLs")
+
+    p_search = sub.add_parser("search", help="Find items similar to a query")
+    p_search.add_argument("query", help="Text, file path, or URL")
+    p_search.add_argument("-k", "--top-k", type=int, default=5)
+
+    args = parser.parse_args(argv)
+    db = _get_default_db()
+
+    if args.command == "add":
+        for item in args.items:
+            id = db.add(item)
+            print(f"added [{detect_modality(item)}] {item} -> {id}")
+    elif args.command == "search":
+        for hit in db.search(args.query, top_k=args.top_k):
+            meta = hit["metadata"]
+            print(f"{hit['similarity']:.4f}  [{meta['modality']}]  {hit['document']}")
+
+
+if __name__ == "__main__":
+    main()
