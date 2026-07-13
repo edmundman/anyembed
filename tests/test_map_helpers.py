@@ -3,10 +3,13 @@
 (_greedy_order/_medoid need numpy and are skipped when it's missing.)
 """
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
 from anyembed_map import (
+    PlaylistStore,
     _greedy_order,
     _medoid,
     _parse_multipart,
@@ -73,6 +76,64 @@ class TestParseMultipart(unittest.TestCase):
         )
         self.assertEqual(fields["relpath"], "album/track.mp3")
         self.assertEqual(files["file"], ("track.mp3", b"FAKEBYTES"))
+
+
+class TestPlaylistStore(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "playlists.json"
+        self.store = PlaylistStore(self.path)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_save_and_list(self):
+        pl = self.store.save("Road Trip", ["a", "b", "a"])
+        self.assertEqual(pl["name"], "Road Trip")
+        self.assertEqual(pl["ids"], ["a", "b"])  # deduped, order kept
+        self.assertEqual(len(self.store.list()), 1)
+
+    def test_persists_across_instances(self):
+        pl = self.store.save("Mix", ["x", "y"])
+        reloaded = PlaylistStore(self.path)
+        self.assertEqual(reloaded.list()[0]["id"], pl["id"])
+        self.assertEqual(reloaded.list()[0]["ids"], ["x", "y"])
+
+    def test_add_tracks_dedupes(self):
+        pl = self.store.save("Mix", ["x"])
+        out = self.store.add_tracks(pl["id"], ["y", "x", "z"])
+        self.assertEqual(out["ids"], ["x", "y", "z"])
+
+    def test_update_rename_and_reorder(self):
+        pl = self.store.save("Old", ["a", "b", "c"])
+        out = self.store.update(pl["id"], name="New", ids=["c", "a"])
+        self.assertEqual(out["name"], "New")
+        self.assertEqual(out["ids"], ["c", "a"])
+
+    def test_delete(self):
+        pl = self.store.save("Gone", ["a"])
+        self.store.delete(pl["id"])
+        self.assertEqual(self.store.list(), [])
+        with self.assertRaises(ValueError):
+            self.store.delete(pl["id"])
+
+    def test_unknown_id_raises(self):
+        with self.assertRaises(ValueError):
+            self.store.update("nope", name="x")
+
+    def test_corrupt_file_starts_empty(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        store = PlaylistStore(self.path)
+        self.assertEqual(store.list(), [])
+
+    def test_blank_name_defaults(self):
+        pl = self.store.save("   ", ["a"])
+        self.assertEqual(pl["name"], "playlist")
+
+    def test_written_file_is_valid_json(self):
+        self.store.save("Mix", ["a"])
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(len(data["playlists"]), 1)
 
 
 @unittest.skipUnless(HAVE_NUMPY, "numpy not installed")

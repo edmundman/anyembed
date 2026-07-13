@@ -22,12 +22,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import mimetypes
 import os
 import random
+import re
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 import webbrowser
 from email import message_from_bytes
 from email.policy import default as email_policy
@@ -54,6 +57,19 @@ DEFAULT_PLAYLIST_COUNT = 6
 DEFAULT_THEME_SIZE = 15
 
 UPLOAD_EXTS = set(EMBEDDABLE_EXTS)
+
+# Browsers stream these natively from /audio (with Range seeking); anything
+# else falls back to the ffmpeg-transcoded /preview clip client-side.
+AUDIO_MIME = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".wma": "audio/x-ms-wma",
+}
 
 
 def _title_from_source(source: str) -> str:
@@ -108,6 +124,84 @@ def _safe_relpath(rel: str) -> Path:
     if not parts:
         raise ValueError(f"Unusable upload path: {rel!r}")
     return Path(*parts)
+
+
+class PlaylistStore:
+    """User-saved playlists, persisted as JSON next to the DB."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self._data: dict = {"playlists": []}
+        if self.path.is_file():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get("playlists"), list):
+                    self._data = loaded
+            except (json.JSONDecodeError, OSError):
+                print(
+                    f"anyembed map: could not read {self.path}; starting with no saved playlists",
+                    flush=True,
+                )
+
+    def _write(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def list(self) -> list[dict]:
+        with self.lock:
+            return [dict(pl) for pl in self._data["playlists"]]
+
+    def _find(self, pid: str) -> dict:
+        for pl in self._data["playlists"]:
+            if pl["id"] == pid:
+                return pl
+        raise ValueError(f"No saved playlist with id {pid!r}")
+
+    def save(self, name: str, ids: list[str]) -> dict:
+        name = (name or "").strip() or "playlist"
+        with self.lock:
+            pl = {
+                "id": uuid.uuid4().hex[:12],
+                "name": name,
+                "ids": list(dict.fromkeys(str(i) for i in ids)),
+                "created_at": time.time(),
+            }
+            self._data["playlists"].append(pl)
+            self._write()
+            return dict(pl)
+
+    def update(
+        self,
+        pid: str,
+        name: Optional[str] = None,
+        ids: Optional[list[str]] = None,
+    ) -> dict:
+        with self.lock:
+            pl = self._find(pid)
+            if name is not None and name.strip():
+                pl["name"] = name.strip()
+            if ids is not None:
+                pl["ids"] = list(dict.fromkeys(str(i) for i in ids))
+            self._write()
+            return dict(pl)
+
+    def add_tracks(self, pid: str, ids: list[str]) -> dict:
+        with self.lock:
+            pl = self._find(pid)
+            for i in ids:
+                i = str(i)
+                if i not in pl["ids"]:
+                    pl["ids"].append(i)
+            self._write()
+            return dict(pl)
+
+    def delete(self, pid: str) -> None:
+        with self.lock:
+            pl = self._find(pid)
+            self._data["playlists"].remove(pl)
+            self._write()
 
 
 class MapIndex:
@@ -447,6 +541,11 @@ class MapIndex:
                 raise ValueError("No known ids in selection")
             return {"tracks": self._ordered_tracks(rows)}
 
+    def resolve_tracks(self, ids: list[str]) -> list[dict]:
+        """Point dicts for *ids*, preserving order, skipping unknown ids."""
+        with self.lock:
+            return [dict(self._by_id[i]) for i in ids if i in self._by_id]
+
     # ------------------------------------------------------------------
     # Ingest (upload + server-side folder)
 
@@ -663,7 +762,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: relative; z-index: 1;
     display: grid;
     grid-template-columns: 1fr minmax(300px, 380px);
-    grid-template-rows: auto 1fr;
+    grid-template-rows: auto 1fr auto;
     height: 100%;
   }
   header {
@@ -729,7 +828,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   button.hbtn:hover:not(:disabled) { color: var(--ink); border-color: var(--muted); }
   button.hbtn.active { background: var(--accent); color: #1a1208; border-color: var(--accent); }
   button.hbtn:disabled { opacity: 0.45; cursor: wait; }
-  #stage-wrap { position: relative; min-height: 0; }
+  #stage-wrap { position: relative; min-height: 0; overflow: hidden; }
   #stage { width: 100%; height: 100%; display: block; cursor: crosshair; }
   #hint {
     position: absolute; left: 1.2rem; bottom: 1.1rem;
@@ -737,30 +836,97 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 0.68rem; color: var(--muted);
     pointer-events: none;
   }
-  #nowbar {
-    position: absolute; left: 50%; transform: translateX(-50%); bottom: 0.9rem;
-    display: flex; align-items: center; gap: 0.55rem;
-    background: rgba(26,23,20,0.92);
-    border: 1px solid var(--line); border-radius: 3px;
-    padding: 0.42rem 0.7rem;
-    backdrop-filter: blur(6px);
-    max-width: min(72%, 540px);
+  #toast {
+    position: absolute; left: 50%; transform: translateX(-50%); bottom: 1rem;
+    background: rgba(26,23,20,0.95);
+    border: 1px solid var(--accent-dim); border-radius: 3px;
+    padding: 0.45rem 0.8rem;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.7rem; color: var(--ink);
+    max-width: min(80%, 560px);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    opacity: 0; pointer-events: none;
+    transition: opacity 250ms ease;
+    z-index: 5;
   }
-  #nowbar button {
-    background: transparent; border: 0; color: var(--ink);
-    cursor: pointer; font-size: 0.95rem; padding: 0.05rem 0.2rem; line-height: 1;
+  #toast.show { opacity: 1; }
+  #pbar {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: minmax(140px, 1fr) minmax(280px, 560px) minmax(140px, 1fr);
+    gap: 1rem; align-items: center;
+    border-top: 1px solid var(--line);
+    background: var(--bg-elev);
+    padding: 0.5rem 1.2rem;
   }
-  #nowbar[hidden] { display: none; }
-  #nowbar button:hover { color: var(--accent); }
-  .nb-info { min-width: 0; }
-  #nbTitle {
-    font-size: 0.8rem; white-space: nowrap; overflow: hidden;
-    text-overflow: ellipsis; max-width: 300px;
+  #pbar[hidden] { display: none; }
+  .pb-left { min-width: 0; }
+  #pbTitle {
+    font-size: 0.85rem; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  #nbMeta {
+  #pbSub {
     font-family: "JetBrains Mono", monospace;
     font-size: 0.62rem; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
+  .pb-center { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; }
+  .pb-buttons { display: flex; gap: 0.75rem; align-items: center; justify-content: center; }
+  .pb-buttons button {
+    background: transparent; border: 0; color: var(--ink);
+    cursor: pointer; font-size: 1rem; padding: 0.05rem 0.15rem; line-height: 1;
+  }
+  .pb-buttons button:hover { color: var(--accent); }
+  .pb-buttons button.mode {
+    font: 600 0.62rem "JetBrains Mono", monospace; letter-spacing: 0.06em;
+    color: var(--muted); border: 1px solid var(--line); border-radius: 2px;
+    padding: 0.2rem 0.4rem;
+  }
+  .pb-buttons button.mode.on { color: var(--accent); border-color: var(--accent-dim); }
+  #pbToggle { font-size: 1.2rem; }
+  .pb-seek { display: flex; gap: 0.55rem; align-items: center; }
+  .pb-seek span {
+    font: 500 0.62rem "JetBrains Mono", monospace;
+    color: var(--muted); min-width: 3.2em; text-align: center; flex: none;
+  }
+  .slider {
+    position: relative; flex: 1; height: 5px;
+    background: var(--line); border-radius: 3px; cursor: pointer;
+  }
+  .slider .fill {
+    position: absolute; left: 0; top: 0; bottom: 0;
+    background: var(--accent); border-radius: 3px; width: 0%;
+  }
+  .slider:hover .fill { background: #f0b45c; }
+  .pb-right { display: flex; gap: 0.4rem; align-items: center; justify-content: flex-end; min-width: 0; }
+  .pb-right button.ghost { padding: 0.28rem 0.45rem; font-size: 0.7rem; white-space: nowrap; }
+  #volBar { width: 64px; flex: none; }
+  .rowbtns { margin-left: auto; display: none; gap: 2px; flex: none; }
+  .track:hover .rowbtns, .chip-row:hover .rowbtns { display: inline-flex; }
+  .rowbtns button {
+    background: transparent; border: 1px solid var(--line); color: var(--muted);
+    font: 500 0.64rem "JetBrains Mono", monospace;
+    padding: 0.05rem 0.3rem; border-radius: 2px; cursor: pointer; line-height: 1.4;
+  }
+  .rowbtns button:hover { color: var(--ink); border-color: var(--muted); }
+  #ctxmenu {
+    position: fixed; z-index: 50;
+    background: var(--bg-elev);
+    border: 1px solid var(--line); border-radius: 3px;
+    box-shadow: 0 8px 26px rgba(0,0,0,0.5);
+    min-width: 180px; max-width: 260px;
+    padding: 0.25rem 0;
+  }
+  #ctxmenu .mi {
+    padding: 0.42rem 0.75rem; font-size: 0.78rem; cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #ctxmenu .mi:hover { background: rgba(242,235,227,0.05); color: var(--accent); }
+  #ctxmenu .mi.head {
+    font: 600 0.6rem "JetBrains Mono", monospace; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--muted); cursor: default;
+  }
+  #ctxmenu .mi.head:hover { background: transparent; color: var(--muted); }
   aside {
     border-left: 1px solid var(--line);
     background: var(--bg-elev);
@@ -965,11 +1131,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   audio { display: none; }
   @media (max-width: 820px) {
-    #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; }
+    #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto auto; }
     aside {
       border-left: 0; border-top: 1px solid var(--line);
-      max-height: 46vh;
+      max-height: 42vh;
     }
+    #pbar { grid-template-columns: 1fr; gap: 0.4rem; }
+    .pb-right { justify-content: center; }
   }
 </style>
 </head>
@@ -995,15 +1163,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div id="stage-wrap">
     <canvas id="stage"></canvas>
     <div id="hint"></div>
-    <div id="nowbar" hidden>
-      <button type="button" id="nbPrev" title="Previous">⏮</button>
-      <button type="button" id="nbPlay" title="Play / stop">▶</button>
-      <button type="button" id="nbNext" title="Next">⏭</button>
-      <div class="nb-info">
-        <div id="nbTitle"></div>
-        <div id="nbMeta"></div>
-      </div>
-    </div>
+    <div id="toast"></div>
   </div>
   <aside id="panel">
     <div class="eyebrow">selection</div>
@@ -1082,11 +1242,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </details>
 
+    <details class="section" id="savedSection">
+      <summary>my playlists <span id="savedCount"></span></summary>
+      <div class="sec-body">
+        <div class="status-line" id="savedStatus"></div>
+        <div id="savedList" class="sec-body" style="margin-top:0"></div>
+      </div>
+    </details>
+
     <details class="section" id="queueSection">
       <summary>queue <span id="queueCount"></span></summary>
       <div class="sec-body">
-        <div class="row-line">
+        <div class="row-line" style="flex-wrap:wrap">
           <button type="button" class="ghost" id="qShuffleBtn">Shuffle</button>
+          <button type="button" class="ghost" id="qSaveBtn">Save as playlist</button>
           <button type="button" class="ghost" id="qDownloadBtn">.m3u8</button>
           <button type="button" class="ghost" id="qClearBtn">Clear</button>
         </div>
@@ -1103,6 +1272,33 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="row" style="font-size:0.68rem">cluster colors take over when clustering is on</div>
     </div>
   </aside>
+  <div id="pbar" hidden>
+    <div class="pb-left">
+      <div id="pbTitle"></div>
+      <div id="pbSub"></div>
+    </div>
+    <div class="pb-center">
+      <div class="pb-buttons">
+        <button type="button" class="mode" id="pbShuffle" title="Shuffle playback order">shuf</button>
+        <button type="button" id="pbPrev" title="Previous (P)">⏮</button>
+        <button type="button" id="pbToggle" title="Play / pause (Space)">▶</button>
+        <button type="button" id="pbNext" title="Next (N)">⏭</button>
+        <button type="button" class="mode" id="pbRepeat" title="Repeat: off / all / one">rep</button>
+      </div>
+      <div class="pb-seek">
+        <span id="pbCur">0:00</span>
+        <div class="slider" id="seekBar"><div class="fill" id="seekFill"></div></div>
+        <span id="pbDur">0:00</span>
+      </div>
+    </div>
+    <div class="pb-right">
+      <button type="button" class="ghost" id="pbAddPl" title="Add current track to a playlist">+ playlist</button>
+      <button type="button" class="ghost" id="pbShare" title="Copy a link to this track">share</button>
+      <button type="button" class="ghost" id="pbDownload" title="Download the file">save</button>
+      <button type="button" class="ghost" id="pbMute" title="Mute / unmute">vol</button>
+      <div class="slider" id="volBar"><div class="fill" id="volFill"></div></div>
+    </div>
+  </div>
 </div>
 <audio id="player" preload="none"></audio>
 <script>
@@ -1158,10 +1354,11 @@ const plStatus = $("plStatus");
 const playlistsEl = $("playlists");
 const clStatus = $("clStatus");
 const clusterListEl = $("clusterList");
-const nowbar = $("nowbar");
-const nbPlay = $("nbPlay");
-const nbTitle = $("nbTitle");
-const nbMeta = $("nbMeta");
+const pbar = $("pbar");
+const pbToggleBtn = $("pbToggle");
+const pbTitle = $("pbTitle");
+const pbSub = $("pbSub");
+const toastEl = $("toast");
 const queueSection = $("queueSection");
 const queueCountEl = $("queueCount");
 const queueListEl = $("queueList");
@@ -1200,6 +1397,12 @@ let uploadBusy = false;
 let localBusy = false;
 let cancelUpload = false;
 let reprojBusy = false;
+let repeatMode = 0;                // 0 off · 1 all · 2 one
+let shuffleMode = false;
+let seeking = false;
+let usingPreview = false;          // current track fell back to the ffmpeg clip
+let savedPlaylists = [];           // [{id, name, ids, tracks}]
+let toastTimer = null;
 
 function escapeHtml(s) {
   return String(s)
@@ -1545,17 +1748,28 @@ function renderPanel(p, kind = "point") {
     `;
     return;
   }
-  const playing = playingId === p.id;
+  const playing = playingId === p.id && !player.paused;
+  const actions = [];
+  if (p.playable) {
+    actions.push(`<button type="button" class="ghost" data-sel="queue">+ queue</button>`);
+    actions.push(`<button type="button" class="ghost" data-sel="next">play next</button>`);
+    actions.push(`<button type="button" class="ghost" data-sel="pl">+ playlist</button>`);
+  }
+  actions.push(`<button type="button" class="ghost" data-sel="share">share</button>`);
+  if (p.modality !== "text") {
+    actions.push(`<button type="button" class="ghost" data-sel="dl">download</button>`);
+  }
   panelBody.innerHTML = `
     <span class="pill ${p.modality}">${p.modality}</span>
     <h1>${escapeHtml(p.title)}</h1>
     <div class="path">${escapeHtml(p.source)}</div>
     <div class="play-row">
       <button id="play" ${p.playable ? "" : "disabled"} class="${playing ? "playing" : ""}">
-        ${playing ? "Stop" : (p.playable ? "Play preview" : "No file")}
+        ${playing ? "Pause" : (p.playable ? "Play" : "No file")}
       </button>
-      <div class="play-meta">${p.playable ? `~${PREVIEW_SEC}s mid-track clip` : "path missing on disk"}</div>
+      <div class="play-meta">${p.playable ? "full track · seek in the player bar" : "path missing on disk"}</div>
     </div>
+    <div class="row-line" style="flex-wrap:wrap">${actions.join("")}</div>
     <canvas id="wave" width="300" height="32"></canvas>
   `;
   const btn = $("play");
@@ -1565,6 +1779,15 @@ function renderPanel(p, kind = "point") {
       togglePlay(p);
     });
   }
+  const wire = (sel, fn) => {
+    const b = panelBody.querySelector(`[data-sel="${sel}"]`);
+    if (b) b.addEventListener("click", fn);
+  };
+  wire("queue", () => enqueue([p]));
+  wire("next", () => enqueue([p], { next: true }));
+  wire("pl", (e) => openPlaylistMenu(e, [p.id]));
+  wire("share", () => shareTrack(p.id));
+  wire("dl", () => downloadTrack(p.id));
   drawWavePlaceholder();
 }
 
@@ -1581,16 +1804,29 @@ function drawWavePlaceholder() {
   }
 }
 
-// ---------------------------------------------------------------- playback / queue
+// ---------------------------------------------------------------- playback
+
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2600);
+}
+
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) return "–:––";
+  s = Math.round(s);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
 
 function playTrack(t) {
-  player.pause();
   playingId = t.id;
   selectedId = t.id;
-  player.src = `/preview?id=${encodeURIComponent(t.id)}`;
-  player.play().catch(() => stopPlay());
+  usingPreview = false;
+  player.src = `/audio?id=${encodeURIComponent(t.id)}`;   // full track, seekable
+  player.play().catch(() => {});
   renderPanel(byId.get(t.id) || t);
-  updateNowbar();
+  updatePlayerBar();
   renderQueue();
   needsFrame = true;
 }
@@ -1600,16 +1836,37 @@ function playQueueIndex(i) {
   queueIdx = ((i % queue.length) + queue.length) % queue.length;
   playTrack(queue[queueIdx]);
 }
-function queueNext() { if (queue.length) playQueueIndex(queueIdx + 1); }
-function queuePrev() { if (queue.length) playQueueIndex(queueIdx - 1); }
+function randQueueIndex() {
+  if (queue.length < 2) return queueIdx;
+  let j;
+  do { j = Math.floor(Math.random() * queue.length); } while (j === queueIdx);
+  return j;
+}
+function queueNext() {
+  if (queue.length) playQueueIndex(shuffleMode ? randQueueIndex() : queueIdx + 1);
+}
+function queuePrev() {
+  if (!queue.length) return;
+  if (playingId && player.currentTime > 4) { player.currentTime = 0; return; }
+  playQueueIndex(queueIdx - 1);
+}
 
 function togglePlay(p) {
   if (playingId === p.id) {
-    stopPlay();
+    togglePause();
     return;
   }
   queueIdx = queue.findIndex(t => t.id === p.id);
   playTrack(p);
+}
+
+function togglePause() {
+  if (!playingId) {
+    if (queue.length) playQueueIndex(queueIdx >= 0 ? queueIdx : 0);
+    return;
+  }
+  if (player.paused) player.play().catch(() => {});
+  else player.pause();
 }
 
 function stopPlay() {
@@ -1617,27 +1874,48 @@ function stopPlay() {
   player.removeAttribute("src");
   player.load();
   playingId = null;
-  const p = POINTS.find(x => x.id === selectedId) || POINTS.find(x => x.id === hoverId);
+  usingPreview = false;
+  const p = byId.get(selectedId) || byId.get(hoverId);
   renderPanel(p || null);
-  updateNowbar();
+  updatePlayerBar();
   renderQueue();
   needsFrame = true;
 }
 
 player.addEventListener("ended", () => {
-  if (queue.length && queueIdx >= 0 && queueIdx < queue.length - 1) {
-    playQueueIndex(queueIdx + 1);
-  } else {
-    stopPlay();
+  if (repeatMode === 2 && playingId) {
+    player.currentTime = 0;
+    player.play().catch(() => {});
+    return;
   }
+  if (queue.length && queueIdx >= 0) {
+    if (shuffleMode && queue.length > 1) { playQueueIndex(randQueueIndex()); return; }
+    if (queueIdx < queue.length - 1) { playQueueIndex(queueIdx + 1); return; }
+    if (repeatMode === 1) { playQueueIndex(0); return; }
+  }
+  stopPlay();
 });
 player.addEventListener("error", () => {
-  if (playingId) {
+  if (!playingId) return;
+  if (!usingPreview) {
+    // Browser can't decode this format natively → ffmpeg-transcoded clip
+    usingPreview = true;
+    player.src = `/preview?id=${encodeURIComponent(playingId)}`;
+    player.play().catch(() => stopPlay());
+    updatePlayerBar();
+  } else {
     stopPlay();
     panelBody.insertAdjacentHTML("beforeend",
-      `<p class="empty" style="color:var(--danger)">Could not decode preview. Is ffmpeg installed?</p>`);
+      `<p class="empty" style="color:var(--danger)">Could not play this file. Is ffmpeg installed?</p>`);
   }
 });
+player.addEventListener("play", updatePlayerBar);
+player.addEventListener("pause", updatePlayerBar);
+player.addEventListener("timeupdate", () => { if (!seeking) updateSeekUI(); });
+player.addEventListener("durationchange", updateSeekUI);
+player.addEventListener("volumechange", updateVolUI);
+
+// ---------------------------------------------------------------- queue
 
 function setQueue(tracks, name, opts = {}) {
   queue = (tracks || []).filter(t => t.playable);
@@ -1645,42 +1923,77 @@ function setQueue(tracks, name, opts = {}) {
   queueIdx = -1;
   queueSection.open = true;
   renderQueue();
-  updateNowbar();
+  updatePlayerBar();
   if (opts.autoplay && queue.length) playQueueIndex(0);
+}
+
+function enqueue(tracks, opts = {}) {
+  const playable = (tracks || []).filter(t => t.playable);
+  if (!playable.length) { toast("nothing playable to queue"); return; }
+  if (!queue.length && !playingId) {
+    setQueue(playable, opts.name || playable[0].title, { autoplay: !!opts.playNow });
+    if (!opts.playNow) toast(`${queue.length} queued`);
+    return;
+  }
+  const fresh = playable.filter(t => !queue.some(q => q.id === t.id));
+  if (!fresh.length) { toast("already in the queue"); return; }
+  if (opts.next && queueIdx >= 0) queue.splice(queueIdx + 1, 0, ...fresh);
+  else queue.push(...fresh);
+  if (!queueName) queueName = opts.name || "custom mix";
+  renderQueue();
+  updatePlayerBar();
+  toast(opts.next
+    ? `playing ${fresh.length === 1 ? `“${fresh[0].title}”` : fresh.length + " tracks"} next`
+    : `${fresh.length} added to queue`);
+}
+
+function removeFromQueue(i) {
+  queue.splice(i, 1);
+  if (i <= queueIdx) queueIdx--;   // "ended" then advances into the removed slot
+  renderQueue();
+  updatePlayerBar();
+}
+
+function moveInQueue(i, delta) {
+  const j = i + delta;
+  if (j < 0 || j >= queue.length) return;
+  [queue[i], queue[j]] = [queue[j], queue[i]];
+  if (queueIdx === i) queueIdx = j;
+  else if (queueIdx === j) queueIdx = i;
+  renderQueue();
+}
+
+function makeTrackRow(t, leftText, buttons, onClick) {
+  const row = document.createElement("div");
+  row.className = "track";
+  row.innerHTML = `<span class="tsim">${leftText}</span><span class="ttl" title="${escapeHtml(t.title)}">${escapeHtml(t.title)}</span><span class="rowbtns"></span>`;
+  const btns = row.querySelector(".rowbtns");
+  for (const [label, title, fn] of buttons || []) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.title = title;
+    b.addEventListener("click", (e) => { e.stopPropagation(); fn(e); });
+    btns.appendChild(b);
+  }
+  if (onClick) row.addEventListener("click", onClick);
+  return row;
 }
 
 function renderQueue() {
   queueCountEl.textContent = queue.length ? `· ${queue.length}` : "";
   queueListEl.innerHTML = "";
   queue.forEach((t, i) => {
-    const row = document.createElement("div");
-    row.className = "track" + (i === queueIdx && playingId ? " active" : "");
-    row.innerHTML = `<span class="tsim">${i + 1}</span><span class="ttl">${escapeHtml(t.title)}</span>`;
-    row.addEventListener("click", () => playQueueIndex(i));
+    const row = makeTrackRow(t, i + 1, [
+      ["↑", "Move up", () => moveInQueue(i, -1)],
+      ["↓", "Move down", () => moveInQueue(i, 1)],
+      ["✕", "Remove from queue", () => removeFromQueue(i)],
+    ], () => playQueueIndex(i));
+    if (i === queueIdx && playingId) row.classList.add("active");
     queueListEl.appendChild(row);
   });
 }
 
-function updateNowbar() {
-  const show = queue.length > 0 || !!playingId;
-  nowbar.hidden = !show;
-  if (!show) return;
-  const cur = playingId
-    ? (byId.get(playingId) || queue.find(t => t.id === playingId))
-    : (queueIdx >= 0 ? queue[queueIdx] : queue[0]);
-  nbPlay.textContent = playingId ? "⏹" : "▶";
-  nbTitle.textContent = cur ? cur.title : "";
-  nbMeta.textContent = queue.length
-    ? `${Math.max(1, queueIdx + 1)}/${queue.length}${queueName ? " · " + queueName : ""}`
-    : "";
-}
-
-$("nbPlay").addEventListener("click", () => {
-  if (playingId) stopPlay();
-  else if (queue.length) playQueueIndex(queueIdx >= 0 ? queueIdx : 0);
-});
-$("nbNext").addEventListener("click", queueNext);
-$("nbPrev").addEventListener("click", queuePrev);
 $("qClearBtn").addEventListener("click", () => { setQueue([], ""); });
 $("qShuffleBtn").addEventListener("click", () => {
   for (let i = queue.length - 1; i > 0; i--) {
@@ -1689,9 +2002,22 @@ $("qShuffleBtn").addEventListener("click", () => {
   }
   queueIdx = playingId ? queue.findIndex(t => t.id === playingId) : -1;
   renderQueue();
-  updateNowbar();
+  updatePlayerBar();
 });
 $("qDownloadBtn").addEventListener("click", () => downloadM3U(queueName || "queue", queue));
+$("qSaveBtn").addEventListener("click", async () => {
+  if (!queue.length) { toast("queue is empty"); return; }
+  const name = window.prompt("Playlist name:", queueName || "my mix");
+  if (!name || !name.trim()) return;
+  try {
+    await postJSON("/api/playlists/save", { name, ids: queue.map(t => t.id) });
+    $("savedSection").open = true;
+    refreshSaved();
+    toast(`saved “${name.trim()}” · ${queue.length} tracks`);
+  } catch (err) {
+    toast(String(err.message || err));
+  }
+});
 
 function downloadM3U(name, tracks) {
   const lines = ["#EXTM3U"];
@@ -1706,6 +2032,247 @@ function downloadM3U(name, tracks) {
   a.download = (name || "playlist").replace(/[^\w\- ]+/g, "_").slice(0, 60) + ".m3u8";
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+// ---------------------------------------------------------------- player bar
+
+function currentTrack() {
+  if (playingId) return byId.get(playingId) || queue.find(t => t.id === playingId) || null;
+  if (queue.length) return queue[Math.max(0, queueIdx)] || queue[0];
+  return null;
+}
+
+function updatePlayerBar() {
+  const show = queue.length > 0 || !!playingId;
+  pbar.hidden = !show;
+  if (!show) return;
+  const cur = currentTrack();
+  pbToggleBtn.textContent = playingId && !player.paused ? "⏸" : "▶";
+  pbTitle.textContent = cur ? cur.title : "";
+  const pos = queue.length ? `${Math.max(1, queueIdx + 1)}/${queue.length}` : "";
+  pbSub.textContent = [pos, queueName, usingPreview && playingId ? "preview clip" : ""]
+    .filter(Boolean).join(" · ");
+  $("pbShuffle").classList.toggle("on", shuffleMode);
+  const rep = $("pbRepeat");
+  rep.classList.toggle("on", repeatMode > 0);
+  rep.textContent = repeatMode === 2 ? "rep1" : "rep";
+  updateSeekUI();
+}
+
+function updateSeekUI() {
+  const d = player.duration;
+  const c = player.currentTime || 0;
+  $("pbCur").textContent = fmtTime(c);
+  $("pbDur").textContent = fmtTime(d);
+  $("seekFill").style.width = isFinite(d) && d > 0 ? `${Math.min(100, (c / d) * 100)}%` : "0%";
+}
+
+function updateVolUI() {
+  $("volFill").style.width = `${(player.muted ? 0 : player.volume) * 100}%`;
+  $("pbMute").textContent = player.muted || player.volume === 0 ? "muted" : "vol";
+}
+
+function sliderBind(el, onFrac, opts = {}) {
+  let active = false;
+  const set = (e) => {
+    const r = el.getBoundingClientRect();
+    onFrac(Math.max(0, Math.min(1, (e.clientX - r.left) / Math.max(1, r.width))));
+  };
+  el.addEventListener("mousedown", (e) => {
+    active = true;
+    if (opts.onStart) opts.onStart();
+    set(e);
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  window.addEventListener("mousemove", (e) => { if (active) set(e); });
+  window.addEventListener("mouseup", () => {
+    if (active) { active = false; if (opts.onEnd) opts.onEnd(); }
+  });
+}
+
+sliderBind($("seekBar"), (f) => {
+  if (isFinite(player.duration) && player.duration > 0) {
+    player.currentTime = f * player.duration;
+    updateSeekUI();
+  }
+}, { onStart: () => { seeking = true; }, onEnd: () => { seeking = false; } });
+
+sliderBind($("volBar"), (f) => {
+  player.volume = f;
+  player.muted = false;
+  try { localStorage.setItem("anyembed_vol", String(f)); } catch (err) { /* private mode */ }
+});
+
+try {
+  const v = parseFloat(localStorage.getItem("anyembed_vol"));
+  if (isFinite(v)) player.volume = Math.max(0, Math.min(1, v));
+} catch (err) { /* private mode */ }
+updateVolUI();
+
+pbToggleBtn.addEventListener("click", togglePause);
+$("pbNext").addEventListener("click", queueNext);
+$("pbPrev").addEventListener("click", queuePrev);
+$("pbShuffle").addEventListener("click", () => { shuffleMode = !shuffleMode; updatePlayerBar(); });
+$("pbRepeat").addEventListener("click", () => { repeatMode = (repeatMode + 1) % 3; updatePlayerBar(); });
+$("pbMute").addEventListener("click", () => { player.muted = !player.muted; });
+$("pbAddPl").addEventListener("click", (e) => {
+  const cur = currentTrack();
+  if (cur) openPlaylistMenu(e, [cur.id]);
+});
+$("pbShare").addEventListener("click", () => {
+  const cur = currentTrack();
+  if (cur) shareTrack(cur.id);
+});
+$("pbDownload").addEventListener("click", () => {
+  const cur = currentTrack();
+  if (cur) downloadTrack(cur.id);
+});
+
+// ---------------------------------------------------------------- share / download
+
+async function shareTrack(id) {
+  const url = `${location.origin}/?track=${encodeURIComponent(id)}`;
+  try {
+    await navigator.clipboard.writeText(url);
+    toast("link copied · " + url);
+  } catch (err) {
+    window.prompt("Copy this link:", url);
+  }
+}
+
+function downloadTrack(id) {
+  const a = document.createElement("a");
+  a.href = `/download?id=${encodeURIComponent(id)}`;
+  a.download = "";
+  a.click();
+}
+
+// ---------------------------------------------------------------- saved playlists
+
+async function refreshSaved() {
+  try {
+    const res = await fetch("/api/playlists/saved");
+    const data = await res.json();
+    savedPlaylists = data.playlists || [];
+    renderSaved();
+  } catch (err) { /* server unreachable */ }
+}
+
+function renderSaved() {
+  $("savedCount").textContent = savedPlaylists.length ? `· ${savedPlaylists.length}` : "";
+  const list = $("savedList");
+  list.innerHTML = "";
+  if (!savedPlaylists.length) {
+    setStatus($("savedStatus"), "none yet — “save as playlist” or “+ playlist” on any track");
+    return;
+  }
+  setStatus($("savedStatus"), "");
+  for (const pl of savedPlaylists) {
+    const div = document.createElement("div");
+    div.className = "pl";
+    div.innerHTML = `
+      <div class="pl-head">
+        <div class="pl-name" title="${escapeHtml(pl.name)}">${escapeHtml(pl.name)}</div>
+        <div class="pl-meta">${pl.tracks.length}</div>
+        <button type="button" class="ghost" data-act="play" title="Play">▶</button>
+        <button type="button" class="ghost" data-act="queue" title="Add to queue">+q</button>
+        <button type="button" class="ghost" data-act="m3u" title="Download .m3u8">⬇</button>
+        <button type="button" class="ghost" data-act="ren" title="Rename">✎</button>
+        <button type="button" class="ghost" data-act="del" title="Delete">✕</button>
+        <button type="button" class="ghost" data-act="toggle" title="Show tracks">≡</button>
+      </div>
+      <div class="pl-tracks" hidden></div>
+    `;
+    const tracksEl = div.querySelector(".pl-tracks");
+    pl.tracks.forEach((t, i) => {
+      const row = makeTrackRow(t, i + 1, [
+        ["+q", "Add to queue", () => enqueue([t], { name: pl.name })],
+        ["✕", "Remove from playlist", async () => {
+          try {
+            await postJSON("/api/playlists/update", { id: pl.id, ids: pl.ids.filter(x => x !== t.id) });
+            refreshSaved();
+          } catch (err) { toast(String(err.message || err)); }
+        }],
+      ], () => {
+        if (t.playable) { queueIdx = queue.findIndex(x => x.id === t.id); playTrack(t); }
+      });
+      tracksEl.appendChild(row);
+    });
+    div.querySelector('[data-act="play"]').addEventListener("click", () => setQueue(pl.tracks, pl.name, { autoplay: true }));
+    div.querySelector('[data-act="queue"]').addEventListener("click", () => enqueue(pl.tracks, { name: pl.name }));
+    div.querySelector('[data-act="m3u"]').addEventListener("click", () => downloadM3U(pl.name, pl.tracks));
+    div.querySelector('[data-act="ren"]').addEventListener("click", async () => {
+      const name = window.prompt("Rename playlist:", pl.name);
+      if (!name || !name.trim()) return;
+      try {
+        await postJSON("/api/playlists/update", { id: pl.id, name });
+        refreshSaved();
+      } catch (err) { toast(String(err.message || err)); }
+    });
+    div.querySelector('[data-act="del"]').addEventListener("click", async () => {
+      if (!window.confirm(`Delete playlist “${pl.name}”?`)) return;
+      try {
+        await postJSON("/api/playlists/delete", { id: pl.id });
+        refreshSaved();
+      } catch (err) { toast(String(err.message || err)); }
+    });
+    div.querySelector('[data-act="toggle"]').addEventListener("click", () => { tracksEl.hidden = !tracksEl.hidden; });
+    list.appendChild(div);
+  }
+}
+
+function closeMenu() {
+  const m = $("ctxmenu");
+  if (m) m.remove();
+}
+
+function openPlaylistMenu(e, trackIds) {
+  closeMenu();
+  const menu = document.createElement("div");
+  menu.id = "ctxmenu";
+  const head = document.createElement("div");
+  head.className = "mi head";
+  head.textContent = trackIds.length === 1 ? "add to playlist" : `add ${trackIds.length} tracks to`;
+  menu.appendChild(head);
+  for (const pl of savedPlaylists) {
+    const mi = document.createElement("div");
+    mi.className = "mi";
+    mi.textContent = pl.name;
+    mi.addEventListener("click", async () => {
+      closeMenu();
+      try {
+        await postJSON("/api/playlists/add", { id: pl.id, ids: trackIds });
+        refreshSaved();
+        toast(`added to “${pl.name}”`);
+      } catch (err) { toast(String(err.message || err)); }
+    });
+    menu.appendChild(mi);
+  }
+  const nw = document.createElement("div");
+  nw.className = "mi";
+  nw.textContent = "+ new playlist…";
+  nw.addEventListener("click", async () => {
+    closeMenu();
+    const name = window.prompt("New playlist name:");
+    if (!name || !name.trim()) return;
+    try {
+      await postJSON("/api/playlists/save", { name, ids: trackIds });
+      $("savedSection").open = true;
+      refreshSaved();
+      toast(`created “${name.trim()}”`);
+    } catch (err) { toast(String(err.message || err)); }
+  });
+  menu.appendChild(nw);
+  document.body.appendChild(menu);
+  menu.style.left = `${Math.min(e.clientX, window.innerWidth - menu.offsetWidth - 8)}px`;
+  menu.style.top = `${Math.min(e.clientY, window.innerHeight - menu.offsetHeight - 8)}px`;
+  setTimeout(() => {
+    window.addEventListener("mousedown", function once(ev) {
+      window.removeEventListener("mousedown", once);
+      if (!menu.contains(ev.target)) closeMenu();
+    });
+  }, 0);
 }
 
 // ---------------------------------------------------------------- mouse / nav
@@ -1878,6 +2445,8 @@ function renderPlaylists(playlists, colored) {
         <div class="pl-name" title="${escapeHtml(pl.name)}">${escapeHtml(pl.name)}</div>
         <div class="pl-meta">${pl.tracks.length}</div>
         <button type="button" class="ghost" data-act="play" title="Play">▶</button>
+        <button type="button" class="ghost" data-act="queue" title="Add to queue">+q</button>
+        <button type="button" class="ghost" data-act="save" title="Save as playlist">＋</button>
         <button type="button" class="ghost" data-act="m3u" title="Download .m3u8">⬇</button>
         <button type="button" class="ghost" data-act="toggle" title="Show tracks">≡</button>
       </div>
@@ -1885,16 +2454,27 @@ function renderPlaylists(playlists, colored) {
     `;
     const tracksEl = div.querySelector(".pl-tracks");
     for (const t of pl.tracks) {
-      const row = document.createElement("div");
-      row.className = "track";
-      row.innerHTML = `<span class="tsim">${t.similarity != null ? t.similarity.toFixed(3) : ""}</span><span class="ttl">${escapeHtml(t.title)}</span>`;
-      row.addEventListener("click", () => {
-        const p = byId.get(t.id);
-        if (p && p.playable) { queueIdx = queue.findIndex(x => x.id === p.id); playTrack(p); }
+      const row = makeTrackRow(t, t.similarity != null ? t.similarity.toFixed(3) : "·", [
+        ["+q", "Add to queue", () => enqueue([t], { name: pl.name })],
+        ["»", "Play next", () => enqueue([t], { next: true })],
+        ["+pl", "Add to a saved playlist", (ev) => openPlaylistMenu(ev, [t.id])],
+      ], () => {
+        const p = byId.get(t.id) || t;
+        if (p.playable) { queueIdx = queue.findIndex(x => x.id === p.id); playTrack(p); }
       });
       tracksEl.appendChild(row);
     }
     div.querySelector('[data-act="play"]').addEventListener("click", () => setQueue(pl.tracks, pl.name, { autoplay: true }));
+    div.querySelector('[data-act="queue"]').addEventListener("click", () => enqueue(pl.tracks, { name: pl.name }));
+    div.querySelector('[data-act="save"]').addEventListener("click", async () => {
+      const name = window.prompt("Save as playlist:", pl.name);
+      if (!name || !name.trim()) return;
+      try {
+        await postJSON("/api/playlists/save", { name, ids: pl.tracks.map(t => t.id) });
+        refreshSaved();
+        toast(`saved “${name.trim()}”`);
+      } catch (err) { toast(String(err.message || err)); }
+    });
     div.querySelector('[data-act="m3u"]').addEventListener("click", () => downloadM3U(pl.name, pl.tracks));
     div.querySelector('[data-act="toggle"]').addEventListener("click", () => { tracksEl.hidden = !tracksEl.hidden; });
     playlistsEl.appendChild(div);
@@ -2296,6 +2876,8 @@ function loop() {
 }
 
 window.addEventListener("resize", resize);
+// Re-fit the canvas when the stage cell changes size (e.g. player bar appears)
+new ResizeObserver(resize).observe($("stage-wrap"));
 window.addEventListener("keydown", (e) => {
   const tag = document.activeElement && document.activeElement.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA") return;
@@ -2304,12 +2886,30 @@ window.addEventListener("keydown", (e) => {
   if (k === "3") setMode("3d");
   if (k === "l") setLassoMode(!lassoMode);
   if (k === "f" || k === "r") resetView();
-  if (e.key === " " && playingId) {
+  if (k === "n") queueNext();
+  if (k === "p") queuePrev();
+  if (e.key === " " && (playingId || queue.length)) {
     e.preventDefault();
-    stopPlay();
+    togglePause();
   }
-  if (k === "escape" && lassoMode) setLassoMode(false);
+  if (e.key === "ArrowRight" && playingId && isFinite(player.duration)) {
+    player.currentTime = Math.min(player.duration, (player.currentTime || 0) + 5);
+  }
+  if (e.key === "ArrowLeft" && playingId) {
+    player.currentTime = Math.max(0, (player.currentTime || 0) - 5);
+  }
+  if (k === "escape") { setLassoMode(false); closeMenu(); }
 });
+
+function focusPoint(p) {
+  setMode("2d");
+  const w = canvas.clientWidth, h = canvas.clientHeight, pad = 48;
+  const s = 2.2;
+  view.scale = s;
+  view.x = w / 2 - (pad + p.x * (w - pad * 2) * s);
+  view.y = h / 2 - (pad + (1 - p.y) * (h - pad * 2) * s);
+  needsFrame = true;
+}
 
 setMode("2d");
 updateStats();
@@ -2317,6 +2917,18 @@ resize();
 draw();
 requestAnimationFrame(loop);
 pollIngest();   // resume the progress bar if a server-side ingest is running
+refreshSaved();
+
+// Shared links: /?track=<id> selects (and plays) that track.
+const sharedTrackId = new URLSearchParams(location.search).get("track");
+if (sharedTrackId && byId.has(sharedTrackId)) {
+  const sp = byId.get(sharedTrackId);
+  selectedId = sp.id;
+  renderPanel(sp);
+  focusPoint(sp);
+  if (sp.playable) setQueue([sp], sp.title, { autoplay: true });
+}
+
 window.addEventListener("load", () => {
   resize();
   draw();
@@ -2386,7 +2998,15 @@ def _ffmpeg_preview(path: str) -> bytes:
     return proc.stdout
 
 
-def make_handler(index: MapIndex, uploads_dir: Path):
+def make_handler(index: MapIndex, uploads_dir: Path, playlists: PlaylistStore):
+    def resolved_playlist(pl: dict) -> dict:
+        return {
+            "id": pl["id"],
+            "name": pl["name"],
+            "ids": pl["ids"],
+            "tracks": index.resolve_tracks(pl["ids"]),
+        }
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
             path = getattr(self, "path", "")
@@ -2419,6 +3039,72 @@ def make_handler(index: MapIndex, uploads_dir: Path):
                 raise ValueError("Expected a JSON object")
             return payload
 
+        def _point_file(self) -> Optional[tuple[dict, str]]:
+            """Resolve ?id= to (point, existing file path), or send a 404."""
+            qs = parse_qs(urlparse(self.path).query)
+            pid = (qs.get("id") or [None])[0]
+            with index.lock:
+                point = index._by_id.get(pid) if pid else None
+                point = dict(point) if point else None
+            if not point:
+                self.send_error(404, "Unknown id")
+                return None
+            source = point.get("source")
+            if not isinstance(source, str) or not os.path.isfile(source):
+                self.send_error(404, "File missing")
+                return None
+            return point, source
+
+        def _serve_file(self, path: str, download_name: Optional[str] = None) -> None:
+            """Stream a local file with HTTP Range support (enables seeking)."""
+            size = os.path.getsize(path)
+            ext = os.path.splitext(path)[1].lower()
+            mime = (
+                AUDIO_MIME.get(ext)
+                or mimetypes.guess_type(path)[0]
+                or "application/octet-stream"
+            )
+            start, end, status = 0, size - 1, 200
+            rng = (self.headers.get("Range") or "").strip()
+            m = re.match(r"bytes=(\d*)-(\d*)$", rng) if rng else None
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), size - 1)
+                else:  # suffix range: bytes=-N
+                    start = max(0, size - int(m.group(2)))
+                if start >= size > 0:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                status = 206
+            length = max(0, end - start + 1)
+            self.send_response(status)
+            self.send_header("Content-Type", mime)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            if download_name:
+                safe = download_name.replace('"', "").replace("\r", "").replace("\n", "")
+                self.send_header("Content-Disposition", f'attachment; filename="{safe}"')
+            self.end_headers()
+            try:
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client hopped elsewhere in the track / closed the tab
+
         # ---------------------------------------------------------- GET
 
         def do_GET(self) -> None:  # noqa: N802
@@ -2447,6 +3133,26 @@ def make_handler(index: MapIndex, uploads_dir: Path):
                 self._send_json(
                     {"points": index.snapshot_points(), "label": index.proj_label}
                 )
+                return
+
+            if parsed.path == "/api/playlists/saved":
+                self._send_json(
+                    {"playlists": [resolved_playlist(pl) for pl in playlists.list()]}
+                )
+                return
+
+            if parsed.path == "/audio":
+                resolved = self._point_file()
+                if resolved:
+                    self._serve_file(resolved[1])
+                return
+
+            if parsed.path == "/download":
+                resolved = self._point_file()
+                if resolved:
+                    self._serve_file(
+                        resolved[1], download_name=os.path.basename(resolved[1])
+                    )
                 return
 
             if parsed.path == "/api/ingest/status":
@@ -2529,6 +3235,32 @@ def make_handler(index: MapIndex, uploads_dir: Path):
                     if not isinstance(ids, list) or not ids:
                         raise ValueError("Provide a list of ids")
                     self._send_json(index.playlist_from_ids([str(i) for i in ids]))
+                elif route == "/api/playlists/save":
+                    payload = self._json_payload()
+                    ids = payload.get("ids") or []
+                    if not isinstance(ids, list) or not ids:
+                        raise ValueError("Provide a list of ids")
+                    pl = playlists.save(payload.get("name") or "", ids)
+                    self._send_json({"playlist": resolved_playlist(pl)})
+                elif route == "/api/playlists/update":
+                    payload = self._json_payload()
+                    pid = payload.get("id") or ""
+                    ids = payload.get("ids")
+                    if ids is not None and not isinstance(ids, list):
+                        raise ValueError("ids must be a list")
+                    pl = playlists.update(pid, name=payload.get("name"), ids=ids)
+                    self._send_json({"playlist": resolved_playlist(pl)})
+                elif route == "/api/playlists/add":
+                    payload = self._json_payload()
+                    ids = payload.get("ids") or []
+                    if not isinstance(ids, list) or not ids:
+                        raise ValueError("Provide a list of ids")
+                    pl = playlists.add_tracks(payload.get("id") or "", ids)
+                    self._send_json({"playlist": resolved_playlist(pl)})
+                elif route == "/api/playlists/delete":
+                    payload = self._json_payload()
+                    playlists.delete(payload.get("id") or "")
+                    self._send_json({"deleted": True})
                 elif route == "/api/reproject":
                     payload = self._json_payload()
                     self._send_json(
@@ -2644,7 +3376,8 @@ def run_server(
     if preload_model:
         index.get_embedder()
     uploads_dir = Path(db_path).resolve().parent / "anyembed_uploads"
-    handler = make_handler(index, uploads_dir)
+    playlists = PlaylistStore(Path(db_path).resolve().parent / "anyembed_playlists.json")
+    handler = make_handler(index, uploads_dir, playlists)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     url = f"http://127.0.0.1:{port}/"
     print(f"map ready → {url}", flush=True)

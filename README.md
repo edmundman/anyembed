@@ -109,8 +109,25 @@ anyembed map                            # music webapp: map, playlists, uploads
 ### Map (music webapp)
 
 `anyembed map` projects the DB into 2D and 3D (PCA → UMAP) and opens a
-local webapp. Hover points for metadata; click audio to play a short
-mid-track preview (needs `ffmpeg`).
+local webapp. Hover points for metadata; click audio to play it.
+
+**Player** — a full player bar sits under the map: play/pause, prev/next,
+a seek bar with times, volume + mute (remembered across visits), shuffle
+playback order, and repeat off/all/one. Tracks stream in full from disk
+with native seeking; formats the browser can't decode fall back to an
+`ffmpeg`-transcoded clip. Keyboard: `Space` play/pause, `N`/`P`
+next/previous, `←`/`→` seek ±5 s.
+
+**Queue & saved playlists** — every track row has hover actions (add to
+queue, play next, add to playlist); queue rows reorder (↑/↓) and remove
+(✕). *Save as playlist* persists the queue to `anyembed_playlists.json`
+next to the DB; the *my playlists* section plays, queues, renames,
+deletes, and exports them, and *+ playlist* on any track (or the player
+bar) opens an add-to-playlist menu.
+
+**Share & download** — *share* copies a `/?track=<id>` link that opens
+the map focused on that track and starts playing it; *download* saves the
+original file.
 
 **Navigation** — in 2D: drag to pan (with inertia), scroll or double-click
 to zoom toward the cursor. In 3D: drag to orbit, shift/right-drag to pan,
@@ -119,8 +136,7 @@ press `F` to reset the view, and turn **spin** on for auto-orbit.
 
 **Lasso listening** — click **lasso** (or press `L`) and draw around an
 area of the map; the audio inside is ordered into a smooth path through
-embedding space and starts playing as a queue. The queue panel and the
-now-playing bar give you prev/next, shuffle, and an `.m3u8` download.
+embedding space and starts playing as a queue in the player bar.
 
 **Playlists** — *Auto playlists* clusters your audio library (K-means over
 the PCA space) into N playlists, colors the map to match, and orders each
