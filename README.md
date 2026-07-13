@@ -67,8 +67,24 @@ embed_folder("notes/", recursive=False)
 ```
 
 Files that fail to decode are skipped with a warning (pass
-`on_error="raise"` to stop instead), and re-running on the same folder
-upserts rather than duplicating.
+`on_error="raise"` to stop instead). Files already in the DB are skipped,
+so re-running after an interrupted ingest resumes where it left off — use
+`skip_existing=False` (CLI: `--force`) to re-embed. The CLI shows a
+progress bar with a summary of embedded/skipped/failed counts.
+
+## Performance
+
+The embedder truncates media before encoding, which is what keeps a big
+library ingestable — tune via `E5OmniEmbedder(...)`:
+
+- `max_media_seconds=120.0` — only the first 2 minutes of audio/video are
+  embedded (`None` = everything).
+- `max_image_tokens=1024` — caps image resolution (each token is a 28x28
+  patch; the upstream default of 16384 is very slow).
+- `max_video_frames=64` — caps sampled video frames.
+
+On Apple Silicon, `PYTORCH_ENABLE_MPS_FALLBACK=1` is set automatically so
+missing MPS ops fall back to CPU instead of crashing.
 
 For more control (custom DB path, collection name, instructions, filters):
 

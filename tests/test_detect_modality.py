@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from anyembed import detect_modality, iter_embeddable_files
+from anyembed import AnyEmbedDB, _default_id, detect_modality, iter_embeddable_files
 
 
 class TestDetectModality(unittest.TestCase):
@@ -98,6 +98,66 @@ class TestIterEmbeddableFiles(unittest.TestCase):
         self._touch(".stfolder/syncthing-folder-123.txt")
         self._touch(".git/objects/a.png")
         self.assertEqual(iter_embeddable_files(self.root), [kept])
+
+
+class _FakeVector:
+    def tolist(self):
+        return [0.0, 1.0]
+
+
+class _FakeEmbedder:
+    def __init__(self):
+        self.embedded = []
+
+    def embed(self, item, modality=None, instruction=None):
+        self.embedded.append(str(item))
+        return _FakeVector()
+
+
+class _FakeCollection:
+    def __init__(self, existing_ids=()):
+        self.ids = set(existing_ids)
+
+    def get(self, ids, include):
+        return {"ids": [i for i in ids if i in self.ids]}
+
+    def upsert(self, ids, embeddings, metadatas, documents):
+        self.ids.update(ids)
+
+
+class TestAddFolderSkipsExisting(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = self._dir.name
+        self.old = os.path.join(self.root, "old.mp3")
+        self.new = os.path.join(self.root, "new.mp3")
+        for p in (self.old, self.new):
+            with open(p, "wb") as f:
+                f.write(b"\x00")
+
+    def _db(self, existing_ids=()):
+        db = AnyEmbedDB.__new__(AnyEmbedDB)
+        db._embedder = _FakeEmbedder()
+        db.collection = _FakeCollection(existing_ids)
+        return db
+
+    def test_skips_files_already_in_db(self):
+        db = self._db(existing_ids=[_default_id("audio", self.old)])
+        results = db.add_folder(self.root)
+        # both files are reported as in the DB, but only the new one embedded
+        self.assertEqual(set(results), {self.old, self.new})
+        self.assertEqual(db._embedder.embedded, [self.new])
+
+    def test_force_reembeds_everything(self):
+        db = self._db(existing_ids=[_default_id("audio", self.old)])
+        db.add_folder(self.root, skip_existing=False)
+        self.assertEqual(sorted(db._embedder.embedded), [self.new, self.old])
+
+    def test_id_formula_is_stable(self):
+        # resume-after-interrupt relies on ids never changing between runs
+        self.assertEqual(_default_id("audio", "/x/a.mp3"), _default_id("audio", "/x/a.mp3"))
+        self.assertNotEqual(_default_id("audio", "/x/a.mp3"), _default_id("text", "/x/a.mp3"))
 
 
 if __name__ == "__main__":
