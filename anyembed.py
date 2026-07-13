@@ -511,6 +511,20 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_search.add_argument("query", help="Text, file path, or URL")
     p_search.add_argument("-k", "--top-k", type=int, default=5)
 
+    p_map = sub.add_parser(
+        "map",
+        help="Open interactive 2D/3D map (hover, play, place text/file queries)",
+    )
+    p_map.add_argument("--db", default=DEFAULT_DB_PATH, help="Chroma DB path")
+    p_map.add_argument("--collection", default=DEFAULT_COLLECTION)
+    p_map.add_argument("--port", type=int, default=8765)
+    p_map.add_argument("--no-open", action="store_true", help="Don't open a browser")
+    p_map.add_argument(
+        "--preload-model",
+        action="store_true",
+        help="Load the embedding model at map startup (else on first query)",
+    )
+
     sub.add_parser("tui", help="Launch the interactive TUI (default)")
 
     args = parser.parse_args(argv)
@@ -519,6 +533,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         from anyembed_tui import AnyEmbedTUI
 
         AnyEmbedTUI().run()
+        return
+
+    if args.command == "map":
+        from anyembed_map import run_server
+
+        run_server(
+            db_path=args.db,
+            collection=args.collection,
+            port=args.port,
+            open_browser=not args.no_open,
+            preload_model=args.preload_model,
+        )
         return
 
     db = _get_default_db()
