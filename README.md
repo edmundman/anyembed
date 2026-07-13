@@ -31,7 +31,9 @@ and run `python anyembed.py ...` directly.)
 
 Notes:
 - The model is ~7B parameters; a GPU with ≥16 GB VRAM (bfloat16) is
-  recommended. CPU works but is slow.
+  recommended. On Apple Silicon it runs on MPS in float16 (≥24 GB unified
+  memory recommended). CPU works but is slow. Devices are auto-detected
+  (cuda → mps → cpu); override with `E5OmniEmbedder(device="cpu")`.
 - Video/audio decoding needs `ffmpeg` available on your system.
 
 ## Usage
@@ -65,8 +67,24 @@ embed_folder("notes/", recursive=False)
 ```
 
 Files that fail to decode are skipped with a warning (pass
-`on_error="raise"` to stop instead), and re-running on the same folder
-upserts rather than duplicating.
+`on_error="raise"` to stop instead). Files already in the DB are skipped,
+so re-running after an interrupted ingest resumes where it left off — use
+`skip_existing=False` (CLI: `--force`) to re-embed. The CLI shows a
+progress bar with a summary of embedded/skipped/failed counts.
+
+## Performance
+
+The embedder truncates media before encoding, which is what keeps a big
+library ingestable — tune via `E5OmniEmbedder(...)`:
+
+- `max_media_seconds=120.0` — only the first 2 minutes of audio/video are
+  embedded (`None` = everything).
+- `max_image_tokens=1024` — caps image resolution (each token is a 28x28
+  patch; the upstream default of 16384 is very slow).
+- `max_video_frames=64` — caps sampled video frames.
+
+On Apple Silicon, `PYTORCH_ENABLE_MPS_FALLBACK=1` is set automatically so
+missing MPS ops fall back to CPU instead of crashing.
 
 For more control (custom DB path, collection name, instructions, filters):
 
@@ -85,7 +103,20 @@ anyembed add photos/dog.jpg clips/bark.wav "a dog barking"
 anyembed add ~/Pictures/pets            # whole folder (recursive)
 anyembed add notes/ --no-recursive
 anyembed search "dog playing" -k 5
+anyembed map                            # interactive UMAP map + audio preview
 ```
+
+### Map
+
+`anyembed map` projects the DB into 2D and 3D (PCA → UMAP) and opens a
+local page where you can hover points for metadata and click audio to play
+a short mid-track preview (needs `ffmpeg`). Toggle **2D / 3D** in the
+header (or press `2` / `3`). In 3D, drag to orbit and scroll to zoom; turn
+**spin** on only if you want auto-orbit.
+
+Use the **place a query** panel to type text or upload an image / song /
+video — it embeds the input (loads the model on first use), drops a white
+diamond on the map, and lists the nearest neighbors with play buttons.
 
 ### TUI
 
