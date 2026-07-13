@@ -103,20 +103,65 @@ anyembed add photos/dog.jpg clips/bark.wav "a dog barking"
 anyembed add ~/Pictures/pets            # whole folder (recursive)
 anyembed add notes/ --no-recursive
 anyembed search "dog playing" -k 5
-anyembed map                            # interactive UMAP map + audio preview
+anyembed map                            # music webapp: map, playlists, uploads
 ```
 
-### Map
+### Map (music webapp)
 
 `anyembed map` projects the DB into 2D and 3D (PCA → UMAP) and opens a
-local page where you can hover points for metadata and click audio to play
-a short mid-track preview (needs `ffmpeg`). Toggle **2D / 3D** in the
-header (or press `2` / `3`). In 3D, drag to orbit and scroll to zoom; turn
-**spin** on only if you want auto-orbit.
+local webapp. Hover points for metadata; click audio to play it.
 
-Use the **place a query** panel to type text or upload an image / song /
-video — it embeds the input (loads the model on first use), drops a white
-diamond on the map, and lists the nearest neighbors with play buttons.
+**Player** — a full player bar sits under the map: play/pause, prev/next,
+a seek bar with times, volume + mute (remembered across visits), shuffle
+playback order, and repeat off/all/one. Tracks stream in full from disk
+with native seeking; formats the browser can't decode fall back to an
+`ffmpeg`-transcoded clip. Keyboard: `Space` play/pause, `N`/`P`
+next/previous, `←`/`→` seek ±5 s.
+
+**Queue & saved playlists** — every track row has hover actions (add to
+queue, play next, add to playlist); queue rows reorder (↑/↓) and remove
+(✕). *Save as playlist* persists the queue to `anyembed_playlists.json`
+next to the DB; the *my playlists* section plays, queues, renames,
+deletes, and exports them, and *+ playlist* on any track (or the player
+bar) opens an add-to-playlist menu.
+
+**Share & download** — *share* copies a `/?track=<id>` link that opens
+the map focused on that track and starts playing it; *download* saves the
+original file.
+
+**Navigation** — in 2D: drag to pan (with inertia), scroll or double-click
+to zoom toward the cursor. In 3D: drag to orbit, shift/right-drag to pan,
+scroll to zoom. Toggle **2D / 3D** in the header (or press `2` / `3`),
+press `F` to reset the view, and turn **spin** on for auto-orbit.
+
+**Lasso listening** — click **lasso** (or press `L`) and draw around an
+area of the map; the audio inside is ordered into a smooth path through
+embedding space and starts playing as a queue in the player bar.
+
+**Playlists** — *Auto playlists* clusters your audio library (K-means over
+the PCA space) into N playlists, colors the map to match, and orders each
+one as a greedy nearest-neighbor path so transitions stay smooth. *Theme
+playlist* embeds a text prompt ("late night driving") and queues the
+closest tracks. The *clusters* section does the coloring alone, with a
+play button per cluster. Any playlist can be exported as `.m3u8` (entries
+point at the original file paths on this machine).
+
+**Shuffle the projection** — **shuffle** re-projects the map instantly
+through a random rotation of the 50-dim PCA space (a genuinely different
+"angle" on the same embeddings); **re-umap** re-runs UMAP with a fresh
+seed (slower). Both animate the dots to their new positions.
+
+**Add music from the browser** — *upload folder / upload files* embeds
+your selection one file at a time with a progress bar, and each dot pops
+onto the map in real time (uploads are stored next to the DB in
+`anyembed_uploads/`). If the music already lives on the machine running
+the server, paste its folder path into the *ingest* box instead — same
+progress bar and live dots, without copying any files. The first file
+loads the embedding model, so it's slow; the rest stream steadily.
+
+**Place a query** — type text or upload an image / song / video; it
+embeds the input, drops a white diamond on the map, and lists the nearest
+neighbors with play buttons.
 
 ### TUI
 

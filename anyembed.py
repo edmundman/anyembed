@@ -514,7 +514,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     p_map = sub.add_parser(
         "map",
-        help="Open interactive 2D/3D map (hover, play, place text/file queries)",
+        help="Open the music webapp: 2D/3D map, lasso listening, auto/theme "
+        "playlists, clustering, and in-browser folder uploads",
     )
     p_map.add_argument("--db", default=DEFAULT_DB_PATH, help="Chroma DB path")
     p_map.add_argument("--collection", default=DEFAULT_COLLECTION)
