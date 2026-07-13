@@ -15,4 +15,8 @@ chromadb>=0.5
 # Terminal UI
 textual>=0.80
 
+# Interactive map (anyembed map)
+scikit-learn>=1.3
+umap-learn>=0.5
+
 numpy

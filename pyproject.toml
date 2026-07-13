@@ -20,10 +20,12 @@ dependencies = [
     "chromadb>=0.5",
     "numpy",
     "textual>=0.80",
+    "scikit-learn>=1.3",
+    "umap-learn>=0.5",
 ]
 
 [project.scripts]
 anyembed = "anyembed:main"
 
 [tool.setuptools]
-py-modules = ["anyembed", "anyembed_tui"]
+py-modules = ["anyembed", "anyembed_tui", "anyembed_map"]

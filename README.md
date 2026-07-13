@@ -103,7 +103,20 @@ anyembed add photos/dog.jpg clips/bark.wav "a dog barking"
 anyembed add ~/Pictures/pets            # whole folder (recursive)
 anyembed add notes/ --no-recursive
 anyembed search "dog playing" -k 5
+anyembed map                            # interactive UMAP map + audio preview
 ```
+
+### Map
+
+`anyembed map` projects the DB into 2D and 3D (PCA → UMAP) and opens a
+local page where you can hover points for metadata and click audio to play
+a short mid-track preview (needs `ffmpeg`). Toggle **2D / 3D** in the
+header (or press `2` / `3`). In 3D, drag to orbit and scroll to zoom; turn
+**spin** on only if you want auto-orbit.
+
+Use the **place a query** panel to type text or upload an image / song /
+video — it embeds the input (loads the model on first use), drops a white
+diamond on the map, and lists the nearest neighbors with play buttons.
 
 ### TUI
 
