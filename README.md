@@ -110,14 +110,19 @@ anyembed map                            # interactive UMAP map + audio preview
 ### Map
 
 `anyembed map` projects the DB into 2D and 3D (PCA → UMAP) and opens a
-local page where you can hover points for metadata and click audio to play
-a short mid-track preview (needs `ffmpeg`). Toggle **2D / 3D** in the
-header (or press `2` / `3`). In 3D, drag to orbit and scroll to zoom; turn
-**spin** on only if you want auto-orbit.
+local page where you can hover points for metadata, preview audio clips,
+queue tracks into a playlist, and stream full songs through the built-in
+player (needs `ffmpeg`). Toggle **2D / 3D** in the header (or press `2` /
+`3`). In 3D, drag to orbit and scroll to zoom; turn **spin** on only if
+you want auto-orbit.
 
 Use the **place a query** panel to type text or upload an image / song /
 video — it embeds the input (loads the model on first use), drops a white
-diamond on the map, and lists the nearest neighbors with play buttons.
+diamond on the map, and lists the nearest neighbors with play and queue
+buttons. Use **Queue visible**, **Queue neighbors**, or **Lasso queue** to
+turn the current view into a quick listening session, then drive playback
+with **Prev** / **Play** / **Next** or the keyboard (`space`, left arrow,
+right arrow, `L` for lasso mode, `Esc` to cancel).
 
 ### TUI
 
