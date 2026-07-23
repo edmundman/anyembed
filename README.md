@@ -74,14 +74,15 @@ progress bar with a summary of embedded/skipped/failed counts.
 
 ## Performance
 
-The embedder truncates media before encoding, which is what keeps a big
-library ingestable — tune via `E5OmniEmbedder(...)`:
+Audio is truncated before encoding (the encoder costs ~25 tokens per
+second, so full songs are slow); images and videos are embedded at full
+fidelity by default. Tune via `E5OmniEmbedder(...)`:
 
-- `max_media_seconds=120.0` — only the first 2 minutes of audio/video are
-  embedded (`None` = everything).
-- `max_image_tokens=1024` — caps image resolution (each token is a 28x28
-  patch; the upstream default of 16384 is very slow).
-- `max_video_frames=64` — caps sampled video frames.
+- `max_audio_seconds=120.0` — only the first 2 minutes of audio are
+  embedded (`None` = whole file).
+- `max_image_tokens=None` — set (e.g. 1024) to cap image resolution for
+  speed; each token is a 28x28 patch, upstream allows up to 16384.
+- `max_video_frames=None` — set (e.g. 64) to cap sampled video frames.
 
 On Apple Silicon, `PYTORCH_ENABLE_MPS_FALLBACK=1` is set automatically so
 missing MPS ops fall back to CPU instead of crashing.
@@ -109,14 +110,19 @@ anyembed map                            # interactive UMAP map + audio preview
 ### Map
 
 `anyembed map` projects the DB into 2D and 3D (PCA → UMAP) and opens a
-local page where you can hover points for metadata and click audio to play
-a short mid-track preview (needs `ffmpeg`). Toggle **2D / 3D** in the
-header (or press `2` / `3`). In 3D, drag to orbit and scroll to zoom; turn
-**spin** on only if you want auto-orbit.
+local page where you can hover points for metadata, preview audio clips,
+queue tracks into a playlist, and stream full songs through the built-in
+player (needs `ffmpeg`). Toggle **2D / 3D** in the header (or press `2` /
+`3`). In 3D, drag to orbit and scroll to zoom; turn **spin** on only if
+you want auto-orbit.
 
 Use the **place a query** panel to type text or upload an image / song /
 video — it embeds the input (loads the model on first use), drops a white
-diamond on the map, and lists the nearest neighbors with play buttons.
+diamond on the map, and lists the nearest neighbors with play and queue
+buttons. Use **Queue visible**, **Queue neighbors**, or **Lasso queue** to
+turn the current view into a quick listening session, then drive playback
+with **Prev** / **Play** / **Next** or the keyboard (`space`, left arrow,
+right arrow, `L` for lasso mode, `Esc` to cancel).
 
 ### TUI
 

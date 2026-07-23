@@ -150,15 +150,16 @@ class E5OmniEmbedder:
         model_name: str = MODEL_NAME,
         device: Optional[str] = None,
         use_audio_in_video: bool = False,
-        max_media_seconds: Optional[float] = 120.0,
-        max_image_tokens: int = 1024,
-        max_video_frames: int = 64,
+        max_audio_seconds: Optional[float] = 120.0,
+        max_image_tokens: Optional[int] = None,
+        max_video_frames: Optional[int] = None,
     ):
-        """max_media_seconds truncates audio/video before encoding (None =
-        embed everything); max_image_tokens caps image resolution (each token
-        is a 28x28-pixel patch; the library default is a very slow 16384);
-        max_video_frames caps sampled video frames. These are the main speed
-        knobs — raise them if you need more fidelity.
+        """max_audio_seconds truncates audio before encoding (None = embed
+        the whole file); it's on by default because songs are long and the
+        encoder costs ~25 tokens per second of audio. Images and videos are
+        NOT capped by default — set max_image_tokens (28x28-pixel patches
+        per image, upstream default 16384) and/or max_video_frames to trade
+        fidelity for speed.
         """
         import torch
         from transformers import (
@@ -168,7 +169,7 @@ class E5OmniEmbedder:
 
         self._torch = torch
         self.use_audio_in_video = use_audio_in_video
-        self.max_media_seconds = max_media_seconds
+        self.max_audio_seconds = max_audio_seconds
         self.max_image_tokens = max_image_tokens
         self.max_video_frames = max_video_frames
         if device is None:
@@ -223,13 +224,11 @@ class E5OmniEmbedder:
             # embeddable format" step. The extra keys cap how much of the
             # media gets encoded (see __init__ docstring).
             element: dict = {"type": modality, modality: item}
-            if modality == "audio" and self.max_media_seconds:
-                element["audio_end"] = self.max_media_seconds
-            elif modality == "video":
-                if self.max_media_seconds:
-                    element["video_end"] = self.max_media_seconds
+            if modality == "audio" and self.max_audio_seconds:
+                element["audio_end"] = self.max_audio_seconds
+            elif modality == "video" and self.max_video_frames:
                 element["max_frames"] = self.max_video_frames
-            elif modality == "image":
+            elif modality == "image" and self.max_image_tokens:
                 element["max_pixels"] = self.max_image_tokens * 28 * 28
             content.append(element)
         if instruction:

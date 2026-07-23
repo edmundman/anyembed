@@ -143,6 +143,7 @@ class MapIndex:
             )
 
         self._by_id = {p["id"]: p for p in self.points}
+        self._index_by_id = {p["id"]: i for i, p in enumerate(self.points)}
         self._embedder = None
         self._embedder_lock = threading.Lock()
 
@@ -175,6 +176,77 @@ class MapIndex:
             p["similarity"] = float(sims[int(i)])
             neighbors.append(p)
         return neighbors
+
+    def nearest_for_id(
+        self, point_id: str, top_k: int = DEFAULT_NEIGHBORS, include_self: bool = False
+    ) -> list[dict[str, Any]]:
+        import numpy as np
+
+        idx = self._index_by_id.get(point_id)
+        if idx is None:
+            raise KeyError(point_id)
+        vec = self.embeddings[idx]
+        sims = self.embeddings @ vec
+        order = np.argsort(-sims)
+        neighbors = []
+        for i in order:
+            i = int(i)
+            if not include_self and i == idx:
+                continue
+            p = dict(self.points[i])
+            p["similarity"] = float(sims[i])
+            neighbors.append(p)
+            if len(neighbors) >= top_k:
+                break
+        return neighbors
+
+    def chain_for_id(self, point_id: str, count: int) -> list[dict[str, Any]]:
+        if count <= 0:
+            return []
+        visited = {point_id}
+        current_id = point_id
+        chain: list[dict[str, Any]] = []
+        while len(chain) < count:
+            next_neighbors = self.nearest_for_id(
+                current_id, top_k=max(count * 4, 12), include_self=False
+            )
+            next_point = None
+            for candidate in next_neighbors:
+                cid = candidate["id"]
+                if cid in visited:
+                    continue
+                next_point = candidate
+                break
+            if next_point is None:
+                break
+            visited.add(next_point["id"])
+            chain.append(next_point)
+            current_id = next_point["id"]
+        return chain
+
+    def semantic_axis(self, text: str) -> dict[str, Any]:
+        import numpy as np
+
+        label = text.strip()
+        if not label:
+            raise ValueError("Axis phrase required")
+        embedder = self.get_embedder()
+        embedding = embedder.embed(label, modality="text")
+        vec = _l2_normalize(np.asarray(embedding, dtype=np.float32).reshape(1, -1))[0]
+        sims = self.embeddings @ vec
+        order = np.argsort(sims)
+        ranks = np.empty(len(order), dtype=np.float32)
+        if len(order) == 1:
+            ranks[order[0]] = 0.5
+        else:
+            ranks[order] = np.linspace(0.0, 1.0, len(order), dtype=np.float32)
+        return {
+            "label": label,
+            "scores": {
+                self.points[i]["id"]: float(ranks[i])
+                for i in range(len(self.points))
+            },
+        }
 
     def get_embedder(self):
         with self._embedder_lock:
@@ -233,6 +305,85 @@ def _parse_multipart(content_type: str, body: bytes) -> tuple[dict[str, str], di
     return fields, files
 
 
+class LibraryState:
+    """Persist lightweight UI library state like tags and saved playlists."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._data = {"playlists": {}, "tags": {}}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                playlists = data.get("playlists") or {}
+                tags = data.get("tags") or {}
+                self._data = {
+                    "playlists": {
+                        str(name): [str(x) for x in ids if isinstance(x, str)]
+                        for name, ids in playlists.items()
+                        if isinstance(name, str) and isinstance(ids, list)
+                    },
+                    "tags": {
+                        str(pid): [str(tag) for tag in vals if isinstance(tag, str)]
+                        for pid, vals in tags.items()
+                        if isinstance(pid, str) and isinstance(vals, list)
+                    },
+                }
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"warning: could not load library state {self.path}: {exc}", flush=True)
+
+    def _save(self) -> None:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        tmp = f"{self.path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, indent=2, sort_keys=True)
+        os.replace(tmp, self.path)
+
+    def snapshot(self) -> dict[str, dict[str, list[str]]]:
+        with self._lock:
+            return json.loads(json.dumps(self._data))
+
+    def save_playlist(self, name: str, ids: list[str]) -> dict[str, dict[str, list[str]]]:
+        clean = [pid for pid in ids if isinstance(pid, str)]
+        if not name.strip():
+            raise ValueError("Playlist name required")
+        with self._lock:
+            self._data["playlists"][name.strip()] = clean
+            self._save()
+            return self.snapshot()
+
+    def delete_playlist(self, name: str) -> dict[str, dict[str, list[str]]]:
+        with self._lock:
+            self._data["playlists"].pop(name, None)
+            self._save()
+            return self.snapshot()
+
+    def set_tags(self, point_id: str, tags: list[str]) -> dict[str, dict[str, list[str]]]:
+        clean = []
+        seen = set()
+        for tag in tags:
+            if not isinstance(tag, str):
+                continue
+            value = tag.strip()
+            if not value:
+                continue
+            low = value.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            clean.append(value)
+        with self._lock:
+            self._data["tags"][point_id] = clean
+            self._save()
+            return self.snapshot()
+
+
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -258,6 +409,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     --danger: #d46a5a;
     --query: #f2ebe3;
     --neighbor: #7ec8ff;
+    --dock-h: 84px;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -286,7 +438,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: grid;
     grid-template-columns: 1fr minmax(300px, 360px);
     grid-template-rows: auto 1fr;
-    height: 100%;
+    height: calc(100% - var(--dock-h));
   }
   header {
     grid-column: 1 / -1;
@@ -305,6 +457,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   header .controls {
     margin-left: auto; display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; justify-content: flex-end;
+  }
+  header .toolbar-btn {
+    appearance: none;
+    border: 1px solid var(--line);
+    background: rgba(255,255,255,0.02);
+    color: var(--muted);
+    border-radius: 999px;
+    padding: 0.42rem 0.72rem;
+    font: 600 0.68rem "JetBrains Mono", monospace;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+  }
+  header .toolbar-btn:hover {
+    color: var(--ink);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
   }
   header input[type="search"] {
     width: min(220px, 30vw);
@@ -342,6 +509,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--accent);
     color: #1a1208;
   }
+  .icon-btn {
+    width: 2.2rem;
+    height: 2.2rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    font-size: 0.95rem;
+    line-height: 1;
+  }
   #stage-wrap { position: relative; min-height: 0; }
   #stage { width: 100%; height: 100%; display: block; cursor: crosshair; }
   #hint {
@@ -349,13 +526,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: "JetBrains Mono", monospace;
     font-size: 0.68rem; color: var(--muted);
     pointer-events: none;
+    max-width: min(46ch, calc(100% - 2.4rem));
   }
   aside {
     border-left: 1px solid var(--line);
     background: var(--bg-elev);
     padding: 1rem 1.15rem;
     display: flex; flex-direction: column; gap: 0.75rem;
-    min-height: 0; overflow: auto;
+    min-height: 0; overflow: auto; scrollbar-gutter: stable;
   }
   aside .eyebrow {
     font-family: "JetBrains Mono", monospace;
@@ -390,7 +568,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .pill.video { color: var(--neighbor); border-color: color-mix(in srgb, var(--neighbor) 45%, var(--line)); }
   .pill.query { color: var(--query); border-color: color-mix(in srgb, var(--query) 40%, var(--line)); }
   .play-row {
-    display: flex; gap: 0.55rem; align-items: center; margin-top: 0.25rem;
+    display: flex; gap: 0.55rem; align-items: center; margin-top: 0.25rem; flex-wrap: wrap;
   }
   button.action, button#play {
     appearance: none; border: 0; cursor: pointer;
@@ -427,6 +605,95 @@ HTML_PAGE = r"""<!DOCTYPE html>
     padding-top: 0.85rem;
     display: flex; flex-direction: column; gap: 0.55rem;
   }
+  .selection-shell {
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+  }
+  .selection-card {
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 0.9rem;
+    background:
+      radial-gradient(circle at top right, rgba(126,200,255,0.08), transparent 35%),
+      radial-gradient(circle at top left, rgba(232,165,75,0.09), transparent 38%),
+      linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.08)),
+      var(--bg);
+    display: grid;
+    grid-template-columns: 82px 1fr;
+    gap: 0.85rem;
+    align-items: start;
+  }
+  .selection-card.query .selection-art {
+    background:
+      radial-gradient(circle at 30% 25%, rgba(255,255,255,0.18), transparent 22%),
+      linear-gradient(135deg, rgba(242,235,227,0.85), rgba(126,200,255,0.7));
+  }
+  .selection-art {
+    width: 82px;
+    height: 82px;
+    border-radius: 18px;
+    border: 1px solid rgba(255,255,255,0.06);
+    background:
+      radial-gradient(circle at 30% 25%, rgba(255,255,255,0.18), transparent 22%),
+      linear-gradient(135deg, rgba(232,165,75,0.9), rgba(126,200,255,0.75));
+    position: relative;
+    overflow: hidden;
+  }
+  .selection-art::after {
+    content: "";
+    position: absolute;
+    inset: 14px;
+    border-radius: 50%;
+    background: rgba(18,16,14,0.72);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08);
+  }
+  .selection-main {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    min-width: 0;
+  }
+  .selection-title {
+    margin: 0;
+    font-size: 1.02rem;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+  }
+  .selection-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: center;
+  }
+  .selection-description {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.82rem;
+    line-height: 1.45;
+  }
+  .selection-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+  }
+  .selection-actions .primary {
+    min-width: 7rem;
+  }
+  .selection-actions .secondary {
+    min-width: 6rem;
+  }
+  .selection-status {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.63rem;
+    color: var(--muted);
+  }
+  .selection-mini-wave {
+    width: 100%;
+    height: 36px;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.02);
+  }
   textarea#queryText {
     width: 100%; min-height: 72px; resize: vertical;
     background: var(--bg);
@@ -460,7 +727,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .neighbors { display: flex; flex-direction: column; gap: 0.35rem; }
   .neighbor {
     display: grid;
-    grid-template-columns: auto 1fr auto;
+    grid-template-columns: auto 1fr auto auto;
     gap: 0.45rem;
     align-items: start;
     padding: 0.4rem 0.35rem;
@@ -484,14 +751,503 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: "JetBrains Mono", monospace;
     font-size: 0.62rem; color: var(--muted);
   }
-  .legend {
-    margin-top: auto; padding-top: 0.85rem;
-    border-top: 1px solid var(--line);
-    display: flex; flex-direction: column; gap: 0.35rem;
+  .queue-actions, .player-controls {
+    display: flex; gap: 0.45rem; flex-wrap: wrap;
   }
-  .legend .row {
-    display: flex; align-items: center; gap: 0.5rem;
-    font-size: 0.76rem; color: var(--muted);
+  .player-shell {
+    display: grid;
+    grid-template-columns: auto minmax(320px, 1fr) auto;
+    gap: 1rem;
+    align-items: center;
+    min-height: var(--dock-h);
+  }
+  .player-art {
+    width: 52px;
+    height: 52px;
+    border-radius: 12px;
+    background:
+      radial-gradient(circle at 35% 30%, rgba(255,255,255,0.22), transparent 25%),
+      radial-gradient(circle at 50% 50%, rgba(232,165,75,0.95), rgba(154,94,24,0.9) 68%, rgba(30,23,20,1) 69%, rgba(30,23,20,1) 100%);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
+    position: relative;
+  }
+  .player-art::after {
+    content: "";
+    position: absolute;
+    inset: 20px;
+    border-radius: 50%;
+    background: rgba(18,16,14,0.9);
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+  }
+  .player-main { display: contents; }
+  .player-track {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: 52px minmax(0, 1fr);
+    gap: 0.7rem;
+    align-items: center;
+  }
+  .player-kicker {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    color: var(--accent);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .player-title {
+    font-size: 0.9rem;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .player-subtitle {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .player-progress {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.28rem;
+    min-width: 0;
+  }
+  .player-times {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 0.55rem;
+    align-items: center;
+  }
+  .player-progress time {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    color: var(--muted);
+  }
+  .player-progress input[type="range"] {
+    width: 100%;
+    margin: 0;
+    accent-color: var(--accent);
+  }
+  .player-controls {
+    align-items: center;
+    justify-content: flex-start;
+    gap: 0.35rem;
+  }
+  .player-tools {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+  }
+  .ghost.active {
+    color: #1a1208;
+    background: var(--accent);
+    border-color: var(--accent);
+    font-weight: 700;
+  }
+  .player-controls .transport {
+    min-width: 2.9rem;
+  }
+  .player-controls .transport.primary {
+    background: var(--accent);
+    color: #1a1208;
+    border: 0;
+    font-weight: 700;
+  }
+  .player-state {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    color: var(--muted);
+    min-width: 3rem;
+    text-align: right;
+  }
+  .player-side {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    justify-self: end;
+    min-width: 0;
+  }
+  .volume-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 140px;
+  }
+  .volume-wrap input[type="range"] {
+    width: 100px;
+    accent-color: var(--accent);
+  }
+  .mini-track {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 160px);
+    gap: 0.55rem;
+    align-items: center;
+    min-width: 0;
+  }
+  .mini-art {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background:
+      radial-gradient(circle at 35% 30%, rgba(255,255,255,0.22), transparent 25%),
+      radial-gradient(circle at 50% 50%, rgba(232,165,75,0.95), rgba(154,94,24,0.9) 68%, rgba(30,23,20,1) 69%, rgba(30,23,20,1) 100%);
+    position: relative;
+  }
+  .mini-art::after {
+    content: "";
+    position: absolute;
+    inset: 12px;
+    border-radius: 50%;
+    background: rgba(18,16,14,0.9);
+  }
+  .mini-title {
+    font-size: 0.74rem;
+    line-height: 1.1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .mini-subtitle {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.58rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .queue-drawer {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: var(--dock-h);
+    z-index: 4;
+    padding: 0 1rem;
+    pointer-events: none;
+  }
+  .queue-drawer[hidden] { display: none; }
+  .queue-sheet {
+    max-width: 1400px;
+    margin: 0 auto;
+    border: 1px solid var(--line);
+    border-bottom: 0;
+    border-top-left-radius: 16px;
+    border-top-right-radius: 16px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.14)),
+      var(--bg-elev);
+    box-shadow: 0 -16px 36px rgba(0,0,0,0.32);
+    pointer-events: auto;
+  }
+  .queue-header {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.8rem 0.9rem 0.65rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .queue-header .spacer { flex: 1; }
+  .queue-library {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(240px, 360px);
+    gap: 0.9rem;
+    padding: 0.9rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .queue-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    min-width: 0;
+  }
+  .popover {
+    position: absolute;
+    right: 1rem;
+    bottom: calc(var(--dock-h) + 0.6rem);
+    z-index: 6;
+    width: min(280px, calc(100vw - 2rem));
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 0.85rem;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.15)),
+      var(--bg-elev);
+    box-shadow: 0 16px 36px rgba(0,0,0,0.34);
+  }
+  .popover.inline {
+    position: static;
+    width: 100%;
+    margin-top: 0.2rem;
+    box-shadow: none;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.02);
+  }
+  .popover[hidden] { display: none; }
+  .popover .row {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    margin-top: 0.55rem;
+  }
+  .popover input[type="number"] {
+    width: 72px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 10px;
+    padding: 0.42rem 0.55rem;
+    font: 600 0.8rem "JetBrains Mono", monospace;
+  }
+  .popover .hint {
+    color: var(--muted);
+    font-size: 0.72rem;
+    line-height: 1.35;
+    margin-top: 0.5rem;
+  }
+  .queue-drawer .playlist {
+    max-height: 34vh;
+    padding: 0.7rem 0.9rem 0.9rem;
+  }
+  #player-dock {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 3;
+    padding: 0 1rem;
+    background: rgba(18,16,14,0.96);
+    backdrop-filter: blur(18px);
+    border-top: 1px solid var(--line);
+  }
+  #player-dock .player-shell {
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  .playlist-note, .playlist-meta {
+    color: var(--muted);
+    font-size: 0.76rem;
+    line-height: 1.45;
+  }
+  .playlist-meta {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.66rem;
+  }
+  .playlist-meta.busy { color: var(--accent); }
+  .playlist {
+    display: flex; flex-direction: column; gap: 0.35rem;
+    min-height: 0; max-height: 28vh; overflow: auto;
+  }
+  .track {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto;
+    gap: 0.45rem;
+    align-items: center;
+    padding: 0.42rem 0.35rem;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    background: rgba(242,235,227,0.02);
+  }
+  .track.active {
+    border-color: color-mix(in srgb, var(--accent) 48%, var(--line));
+    background: rgba(232,165,75,0.08);
+  }
+  .track-num {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.66rem;
+    color: var(--muted);
+    min-width: 1.6rem;
+  }
+  .track-title {
+    font-size: 0.8rem;
+    line-height: 1.25;
+  }
+  .track-sub {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    color: var(--muted);
+  }
+  .tag-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    align-items: center;
+  }
+  .tag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28rem;
+    padding: 0.24rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--neighbor) 42%, var(--line));
+    color: var(--neighbor);
+    font: 500 0.66rem "JetBrains Mono", monospace;
+    background: rgba(126,200,255,0.08);
+  }
+  .tag-input-row {
+    display: flex;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+  }
+  .tag-input-row input, .playlist-save-row input {
+    flex: 1 1 180px;
+    min-width: 0;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 10px;
+    padding: 0.5rem 0.65rem;
+    font: 500 0.8rem "Instrument Sans", sans-serif;
+    outline: none;
+  }
+  .tag-input-row input:focus, .playlist-save-row input:focus {
+    border-color: var(--accent-dim);
+  }
+  .playlist-save-row {
+    display: flex;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+  }
+  .saved-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.38rem;
+    max-height: 24vh;
+    overflow: auto;
+  }
+  .saved-item {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 0.45rem;
+    align-items: center;
+    padding: 0.42rem 0.35rem;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.02);
+  }
+  .saved-item:hover {
+    border-color: var(--line);
+  }
+  .saved-name {
+    font-size: 0.8rem;
+  }
+  .saved-count {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    color: var(--muted);
+  }
+  .ghost.danger {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--line));
+  }
+  .ghost.danger:hover {
+    color: #ffd4cf;
+    border-color: var(--danger);
+  }
+  .info-modal {
+    position: fixed;
+    right: 1rem;
+    top: 4.2rem;
+    width: min(320px, calc(100vw - 2rem));
+    z-index: 5;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 0.9rem;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.16)),
+      var(--bg-elev);
+    box-shadow: 0 18px 40px rgba(0,0,0,0.34);
+  }
+  .info-modal[hidden] { display: none; }
+  .axes-modal {
+    position: fixed;
+    left: 1rem;
+    top: 4.2rem;
+    width: min(360px, calc(100vw - 2rem));
+    z-index: 5;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 0.9rem;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.16)),
+      var(--bg-elev);
+    box-shadow: 0 18px 40px rgba(0,0,0,0.34);
+  }
+  .axes-modal[hidden] { display: none; }
+  .axes-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.55rem;
+    align-items: center;
+    margin-top: 0.65rem;
+  }
+  .axes-grid .label {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.66rem;
+    color: var(--muted);
+  }
+  .axes-grid input {
+    width: 100%;
+    min-width: 0;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 10px;
+    padding: 0.5rem 0.65rem;
+    font: 500 0.8rem "Instrument Sans", sans-serif;
+    outline: none;
+  }
+  .axes-grid input:focus { border-color: var(--accent-dim); }
+  .axes-actions {
+    display: flex;
+    gap: 0.45rem;
+    margin-top: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .axes-status {
+    min-height: 1em;
+    margin-top: 0.55rem;
+    color: var(--muted);
+    font: 0.66rem "JetBrains Mono", monospace;
+  }
+  .axes-overlay {
+    position: absolute;
+    left: 1rem;
+    bottom: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.32rem;
+    pointer-events: none;
+    z-index: 2;
+  }
+  .axis-chip {
+    width: fit-content;
+    max-width: min(320px, calc(100vw - 4rem));
+    padding: 0.32rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(18,16,14,0.78);
+    color: var(--muted);
+    font: 0.64rem "JetBrains Mono", monospace;
+    letter-spacing: 0.02em;
+  }
+  .axis-chip strong {
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .info-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.4rem 0.65rem;
+    align-items: center;
+    color: var(--muted);
+    font-size: 0.76rem;
+  }
+  .info-grid .label {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.66rem;
+    color: var(--ink);
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
   .dot.diamond {
@@ -503,8 +1259,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
     #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; }
     aside {
       border-left: 0; border-top: 1px solid var(--line);
-      max-height: 46vh;
+      max-height: 52vh;
     }
+    .selection-card { grid-template-columns: 1fr; }
+    .selection-art { width: 100%; height: 76px; }
+    .player-shell { grid-template-columns: 1fr; gap: 0.5rem; min-height: auto; padding: 0.55rem 0; }
+    .player-track { display: none; }
+    .player-controls { justify-content: center; }
+    .player-side { justify-self: stretch; justify-content: space-between; gap: 0.5rem; }
+    .mini-track { grid-template-columns: 28px minmax(0, 1fr); }
+    .mini-art { width: 28px; height: 28px; }
+    .mini-art::after { inset: 10px; }
+    .volume-wrap { min-width: 92px; }
+    .volume-wrap input[type="range"] { width: 58px; }
+    .queue-header { flex-wrap: wrap; }
+    .queue-library { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -520,16 +1289,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
       <label class="tog spin-tog" id="spinLabel"><input type="checkbox" id="spin" /> spin</label>
       <label class="tog"><input type="checkbox" id="audioOnly" checked /> audio only</label>
+      <button type="button" class="toolbar-btn" id="axesToggle">Axes</button>
+      <button type="button" class="toolbar-btn icon-btn" id="infoToggle" aria-label="Info">i</button>
+      <button type="button" class="toolbar-btn" id="resetView">Reset view</button>
       <input type="search" id="q" placeholder="Filter by title…" autocomplete="off" />
     </div>
   </header>
   <div id="stage-wrap">
     <canvas id="stage"></canvas>
     <div id="hint">scroll zoom · drag pan · click play · hover for info</div>
+    <div class="axes-overlay" id="axesOverlay"></div>
   </div>
   <aside id="panel">
     <div class="eyebrow">selection</div>
-    <div id="panel-body">
+    <div id="panel-body" class="selection-shell">
       <p class="empty">Hover a point to inspect it. Click audio to preview. Drop a query below to place it on the map.</p>
     </div>
 
@@ -551,14 +1324,121 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="legend">
-      <div class="row"><span class="dot" style="background:var(--audio)"></span> audio</div>
-      <div class="row"><span class="dot" style="background:var(--image)"></span> image</div>
-      <div class="row"><span class="dot" style="background:var(--text)"></span> text</div>
-      <div class="row"><span class="dot diamond" style="background:var(--query)"></span> your query</div>
-      <div class="row"><span class="dot" style="background:var(--neighbor)"></span> neighbor</div>
+    <div class="section">
+      <div class="eyebrow">library</div>
+      <div class="playlist-meta" id="libraryStatus">Saved playlists and tags stay local to this DB.</div>
     </div>
   </aside>
+</div>
+<div class="axes-modal" id="axesModal" hidden>
+  <div class="eyebrow">semantic axes</div>
+  <div class="axes-grid">
+    <span class="label">x</span>
+    <input type="text" id="axisX" placeholder="e.g. dreamy" />
+    <span class="label">y</span>
+    <input type="text" id="axisY" placeholder="e.g. PUNK" />
+    <span class="label">z</span>
+    <input type="text" id="axisZ" placeholder="3D only, e.g. noisy" />
+  </div>
+  <div class="axes-actions">
+    <button type="button" class="action" id="applyAxes">Apply</button>
+    <button type="button" class="ghost" id="clearAxes">Reset</button>
+  </div>
+  <div class="axes-status" id="axesStatus">Set one or more phrases to bend the map around your own meanings.</div>
+</div>
+<div class="info-modal" id="infoModal" hidden>
+  <div class="eyebrow">info</div>
+  <div class="info-grid" style="margin-top:0.55rem">
+    <span class="dot" style="background:var(--audio)"></span><span>audio</span>
+    <span class="dot" style="background:var(--image)"></span><span>image</span>
+    <span class="dot" style="background:var(--text)"></span><span>text</span>
+    <span class="dot diamond" style="background:var(--query)"></span><span>query</span>
+    <span class="dot" style="background:var(--neighbor)"></span><span>neighbor</span>
+    <span class="label">drag</span><span>orbit in 3D, pan in 2D</span>
+    <span class="label">shift-drag</span><span>pan in 3D</span>
+    <span class="label">L</span><span>lasso mode</span>
+    <span class="label">2 / 3</span><span>projection mode</span>
+  </div>
+</div>
+<div class="queue-drawer" id="queueDrawer" hidden>
+  <div class="queue-sheet">
+    <div class="queue-header">
+      <div class="eyebrow">queue</div>
+      <div class="playlist-meta" id="playlistMeta">0 tracks queued</div>
+      <div class="spacer"></div>
+      <button type="button" class="ghost" id="queueVisible">Visible</button>
+      <button type="button" class="ghost" id="queueNeighbors">Neighbors</button>
+      <button type="button" class="ghost" id="lassoPlaylist">Lasso</button>
+      <button type="button" class="ghost danger" id="clearPlaylist">Clear</button>
+      <button type="button" class="ghost icon-btn" id="closeQueue" aria-label="Close queue">&#10005;</button>
+    </div>
+    <div class="queue-library">
+      <div class="queue-pane">
+        <div class="eyebrow">save queue</div>
+        <div class="playlist-save-row">
+          <input type="text" id="playlistName" placeholder="Name this playlist…" />
+          <button type="button" class="ghost" id="savePlaylist">Save</button>
+        </div>
+        <div class="playlist-meta">Save the current queue as a reusable playlist.</div>
+        <div class="popover inline" id="neighborsPopover" hidden>
+          <div class="eyebrow">neighbors</div>
+          <div class="row">
+            <label class="label" for="neighborsCount">songs</label>
+            <input type="number" id="neighborsCount" min="2" max="50" step="1" value="5" />
+          </div>
+          <div class="row">
+            <label class="tog"><input type="checkbox" id="neighborsChain" /> chain</label>
+          </div>
+          <div class="row">
+            <button type="button" class="action" id="neighborsGo">Build</button>
+            <button type="button" class="ghost" id="neighborsCancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+      <div class="queue-pane">
+        <div class="eyebrow">saved playlists</div>
+        <div class="saved-list" id="savedPlaylists"></div>
+      </div>
+    </div>
+    <div class="playlist" id="playlist"></div>
+  </div>
+</div>
+<div id="player-dock">
+  <div class="player-shell">
+    <div class="player-main">
+      <div class="player-controls">
+        <button type="button" class="ghost transport icon-btn" id="prevTrack" aria-label="Previous">&#9664;&#9664;</button>
+        <button type="button" class="ghost transport primary icon-btn" id="togglePlaylistPlay" aria-label="Play or pause">&#9654;</button>
+        <button type="button" class="ghost transport icon-btn" id="nextTrack" aria-label="Next">&#9654;&#9654;</button>
+        <button type="button" class="ghost transport icon-btn" id="shuffleToggle" aria-label="Shuffle">S</button>
+        <button type="button" class="ghost transport icon-btn" id="repeatToggle" aria-label="Repeat">R</button>
+      </div>
+      <div class="player-progress">
+        <input type="range" id="seekBar" min="0" max="1" step="0.01" value="0" />
+        <div class="player-times">
+          <time id="currentTime">0:00</time>
+          <div></div>
+          <time id="durationTime">0:00</time>
+        </div>
+      </div>
+      <div class="player-tools">
+        <div class="volume-wrap">
+          <button type="button" class="ghost icon-btn" id="volumeIcon" aria-label="Volume">&#128266;</button>
+          <input type="range" id="volumeBar" min="0" max="1" step="0.01" value="1" aria-label="Volume" />
+        </div>
+        <div class="mini-track">
+          <div class="mini-art"></div>
+          <div>
+            <div class="player-kicker" id="playerKicker">Player</div>
+            <div class="mini-title" id="nowPlaying">No track selected</div>
+            <div class="mini-subtitle" id="playerSubtitle">No track loaded</div>
+          </div>
+        </div>
+        <div class="player-state" id="playerState">idle</div>
+        <button type="button" class="ghost icon-btn" id="queueToggle" aria-label="Toggle queue">&#9776;</button>
+      </div>
+    </div>
+  </div>
 </div>
 <audio id="player" preload="none"></audio>
 <script>
@@ -590,6 +1470,18 @@ const spinLabel = document.getElementById("spinLabel");
 const hintEl = document.getElementById("hint");
 const mode2dBtn = document.getElementById("mode2d");
 const mode3dBtn = document.getElementById("mode3d");
+const axesToggleBtn = document.getElementById("axesToggle");
+const axesModalEl = document.getElementById("axesModal");
+const axesOverlayEl = document.getElementById("axesOverlay");
+const axisXEl = document.getElementById("axisX");
+const axisYEl = document.getElementById("axisY");
+const axisZEl = document.getElementById("axisZ");
+const applyAxesBtn = document.getElementById("applyAxes");
+const clearAxesBtn = document.getElementById("clearAxes");
+const axesStatusEl = document.getElementById("axesStatus");
+const infoToggleBtn = document.getElementById("infoToggle");
+const infoModalEl = document.getElementById("infoModal");
+const resetViewBtn = document.getElementById("resetView");
 const queryTextEl = document.getElementById("queryText");
 const queryFileEl = document.getElementById("queryFile");
 const queryBtn = document.getElementById("queryBtn");
@@ -598,13 +1490,45 @@ const queryStatus = document.getElementById("queryStatus");
 const fileLabel = document.getElementById("fileLabel");
 const neighborBlock = document.getElementById("neighborBlock");
 const neighborsEl = document.getElementById("neighbors");
+const queueDrawerEl = document.getElementById("queueDrawer");
+const queueVisibleBtn = document.getElementById("queueVisible");
+const queueNeighborsBtn = document.getElementById("queueNeighbors");
+const lassoPlaylistBtn = document.getElementById("lassoPlaylist");
+const clearPlaylistBtn = document.getElementById("clearPlaylist");
+const closeQueueBtn = document.getElementById("closeQueue");
+const neighborsPopoverEl = document.getElementById("neighborsPopover");
+const neighborsCountEl = document.getElementById("neighborsCount");
+const neighborsChainEl = document.getElementById("neighborsChain");
+const neighborsGoBtn = document.getElementById("neighborsGo");
+const neighborsCancelBtn = document.getElementById("neighborsCancel");
+const nowPlayingEl = document.getElementById("nowPlaying");
+const playerKickerEl = document.getElementById("playerKicker");
+const playerSubtitleEl = document.getElementById("playerSubtitle");
+const playerStateEl = document.getElementById("playerState");
+const currentTimeEl = document.getElementById("currentTime");
+const durationTimeEl = document.getElementById("durationTime");
+const seekBarEl = document.getElementById("seekBar");
+const volumeIconBtn = document.getElementById("volumeIcon");
+const volumeBarEl = document.getElementById("volumeBar");
+const shuffleToggleBtn = document.getElementById("shuffleToggle");
+const prevTrackBtn = document.getElementById("prevTrack");
+const nextTrackBtn = document.getElementById("nextTrack");
+const repeatToggleBtn = document.getElementById("repeatToggle");
+const togglePlaylistPlayBtn = document.getElementById("togglePlaylistPlay");
+const queueToggleBtn = document.getElementById("queueToggle");
+const playlistMetaEl = document.getElementById("playlistMeta");
+const playlistEl = document.getElementById("playlist");
+const playlistNameEl = document.getElementById("playlistName");
+const savePlaylistBtn = document.getElementById("savePlaylist");
+const savedPlaylistsEl = document.getElementById("savedPlaylists");
+const libraryStatusEl = document.getElementById("libraryStatus");
 
 let mode = "2d";
 let hoverId = null;
 let selectedId = null;
 let playingId = null;
 let view = { x: 0, y: 0, scale: 1 };
-let cam3 = { yaw: 0.55, pitch: 0.35, dist: 2.35 };
+let cam3 = { yaw: 0.55, pitch: 0.35, dist: 2.35, panX: 0, panY: 0 };
 let autoOrbit = false;
 let drag = null;
 let anim = 1;
@@ -613,6 +1537,68 @@ let needsFrame = true;
 let queryPoint = null; // {title, modality, x,y,x3,y3,z3}
 let neighborIds = new Set();
 let queryBusy = false;
+let playlist = [];
+let currentQueueIndex = -1;
+let playbackMode = null; // "preview" | "queue" | null
+let lassoMode = false;
+let lassoPoints = [];
+let lassoSelectedIds = new Set();
+let playerSeekDragging = false;
+let playerStatus = "idle";
+let shuffleMode = false;
+let repeatMode = false;
+let queueDrawerOpen = false;
+let activeAxes = { x: null, y: null, z: null };
+let libraryState = { playlists: {}, tags: {} };
+
+function currentSeedId() {
+  return selectedId || playingId || (currentTrack() && currentTrack().id) || null;
+}
+
+function setNeighborsPopover(open) {
+  const hasSeed = !!currentSeedId();
+  neighborsPopoverEl.hidden = !open;
+  queueNeighborsBtn.classList.toggle("active", open);
+  neighborsGoBtn.disabled = !hasSeed;
+  neighborsCountEl.disabled = !hasSeed;
+  neighborsChainEl.disabled = !hasSeed;
+  if (open) {
+    playlistMetaEl.textContent = hasSeed
+      ? "Pick how many nearby songs to pull into the queue"
+      : "Select or play a song first";
+  }
+}
+
+const byId = new Map(POINTS.map(p => [p.id, p]));
+
+function semanticCoord(axisKey, point, fallback) {
+  const axis = activeAxes[axisKey];
+  if (!axis || !axis.scores) return fallback;
+  const score = axis.scores[point.id];
+  return Number.isFinite(score) ? score : fallback;
+}
+
+function activeAxisEntries() {
+  return Object.entries(activeAxes).filter(([, axis]) => axis && axis.label);
+}
+
+function renderAxesOverlay() {
+  const entries = activeAxisEntries();
+  axesOverlayEl.innerHTML = "";
+  axesOverlayEl.hidden = entries.length === 0;
+  for (const [key, axis] of entries) {
+    const chip = document.createElement("div");
+    chip.className = "axis-chip";
+    chip.innerHTML = `<strong>${key.toUpperCase()}</strong> least ${escapeHtml(axis.label)} <span style="color:var(--accent)">→</span> most ${escapeHtml(axis.label)}`;
+    axesOverlayEl.appendChild(chip);
+  }
+}
+
+function closeTransientPanels({ keep = null } = {}) {
+  if (keep !== "axes") axesModalEl.hidden = true;
+  if (keep !== "info") infoModalEl.hidden = true;
+  if (keep !== "neighbors") setNeighborsPopover(false);
+}
 
 function visiblePoints() {
   const q = qEl.value.trim().toLowerCase();
@@ -631,14 +1617,34 @@ function setMode(next) {
   mode3dBtn.classList.toggle("active", mode === "3d");
   spinLabel.classList.toggle("visible", mode === "3d");
   hintEl.textContent = mode === "3d"
-    ? "drag orbit · scroll zoom · click play · toggle spin"
-    : "scroll zoom · drag pan · click play · hover for info";
+    ? "drag orbit · shift/right-drag pan · scroll zoom · click inspect"
+    : "scroll zoom · drag pan · click inspect";
+  if (lassoMode) {
+    hintEl.textContent = "drag a lasso around a cluster to queue it";
+  }
   updateStats();
+  needsFrame = true;
+}
+
+function resetView() {
+  view = { x: 0, y: 0, scale: 1 };
+  cam3 = { yaw: 0.55, pitch: 0.35, dist: 2.35, panX: 0, panY: 0 };
   needsFrame = true;
 }
 
 mode2dBtn.addEventListener("click", () => setMode("2d"));
 mode3dBtn.addEventListener("click", () => setMode("3d"));
+axesToggleBtn.addEventListener("click", () => {
+  const nextOpen = axesModalEl.hidden;
+  closeTransientPanels({ keep: nextOpen ? "axes" : null });
+  axesModalEl.hidden = !nextOpen;
+});
+infoToggleBtn.addEventListener("click", () => {
+  const nextOpen = infoModalEl.hidden;
+  closeTransientPanels({ keep: nextOpen ? "info" : null });
+  infoModalEl.hidden = !nextOpen;
+});
+resetViewBtn.addEventListener("click", resetView);
 spinEl.addEventListener("change", () => {
   autoOrbit = spinEl.checked;
   needsFrame = true;
@@ -660,18 +1666,20 @@ function resize() {
 function project2d(p, w, h, pad) {
   const usableW = w - pad * 2;
   const usableH = h - pad * 2;
+  const px = semanticCoord("x", p, p.x);
+  const py = semanticCoord("y", p, p.y);
   return {
-    x: pad + p.x * usableW * view.scale + view.x,
-    y: pad + (1 - p.y) * usableH * view.scale + view.y,
+    x: pad + px * usableW * view.scale + view.x,
+    y: pad + (1 - py) * usableH * view.scale + view.y,
     depth: 0,
     rScale: 1,
   };
 }
 
 function project3d(p, w, h) {
-  let x = (p.x3 ?? p.x) - 0.5;
-  let y = (p.y3 ?? p.y) - 0.5;
-  let z = (p.z3 ?? 0.5) - 0.5;
+  let x = semanticCoord("x", p, p.x3 ?? p.x) - 0.5;
+  let y = semanticCoord("y", p, p.y3 ?? p.y) - 0.5;
+  let z = semanticCoord("z", p, p.z3 ?? 0.5) - 0.5;
   const cy = Math.cos(cam3.yaw), sy = Math.sin(cam3.yaw);
   const cp = Math.cos(cam3.pitch), sp = Math.sin(cam3.pitch);
   let x1 = x * cy - z * sy;
@@ -679,13 +1687,13 @@ function project3d(p, w, h) {
   let y1 = y;
   let y2 = y1 * cp - z1 * sp;
   let z2 = y1 * sp + z1 * cp;
-  let x2 = x1;
+  let x2 = x1 - cam3.panX;
   const zCam = z2 + cam3.dist;
   const focal = Math.min(w, h) * 0.9;
   const scale = focal / Math.max(0.35, zCam);
   return {
     x: w * 0.5 + x2 * scale,
-    y: h * 0.5 - y2 * scale,
+    y: h * 0.5 - (y2 - cam3.panY) * scale,
     depth: zCam,
     rScale: Math.max(0.45, Math.min(1.8, 1.7 / Math.max(0.5, zCam))),
   };
@@ -714,6 +1722,26 @@ function drawAxes3d(w, h) {
   }
 }
 
+function drawAxisLabels2d(w, h) {
+  const xAxis = activeAxes.x;
+  const yAxis = activeAxes.y;
+  if (!xAxis && !yAxis) return;
+  ctx.save();
+  ctx.fillStyle = "rgba(242,235,227,0.72)";
+  ctx.font = '11px "JetBrains Mono"';
+  if (yAxis) {
+    ctx.fillText(`most ${yAxis.label}`, 18, 24);
+    ctx.fillText(`least ${yAxis.label}`, 18, h - 16);
+  }
+  if (xAxis) {
+    const right = `most ${xAxis.label}`;
+    const left = `least ${xAxis.label}`;
+    ctx.fillText(left, 18, h - 36);
+    ctx.fillText(right, Math.max(18, w - ctx.measureText(right).width - 18), h - 36);
+  }
+  ctx.restore();
+}
+
 function drawDiamond(x, y, r, fill, stroke) {
   ctx.beginPath();
   ctx.moveTo(x, y - r);
@@ -728,6 +1756,82 @@ function drawDiamond(x, y, r, fill, stroke) {
     ctx.lineWidth = 1.5;
     ctx.stroke();
   }
+}
+
+function drawLasso() {
+  if (lassoPoints.length < 2) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(lassoPoints[0].x, lassoPoints[0].y);
+  for (let i = 1; i < lassoPoints.length; i++) {
+    ctx.lineTo(lassoPoints[i].x, lassoPoints[i].y);
+  }
+  if (!drag || !drag.lasso) ctx.closePath();
+  ctx.fillStyle = "rgba(126,200,255,0.08)";
+  ctx.strokeStyle = "rgba(126,200,255,0.85)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([7, 5]);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function pointInPolygon(x, y, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x, yi = polygon[i].y;
+    const xj = polygon[j].x, yj = polygon[j].y;
+    const intersects = ((yi > y) !== (yj > y))
+      && (x < ((xj - xi) * (y - yi)) / ((yj - yi) || 1e-9) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function setLassoMode(enabled) {
+  lassoMode = enabled;
+  lassoPoints = [];
+  lassoSelectedIds = new Set();
+  lassoPlaylistBtn.classList.toggle("active", enabled);
+  playlistMetaEl.classList.toggle("busy", enabled);
+  if (enabled) {
+    playlistMetaEl.textContent = "Lasso mode: drag around a cluster to replace the queue";
+    hintEl.textContent = "drag a lasso around a cluster to queue it";
+  } else {
+    updateStats();
+    updatePlaylistControls();
+    renderPlaylist();
+  }
+  needsFrame = true;
+}
+
+function finalizeLasso() {
+  if (lassoPoints.length < 3) {
+    setLassoMode(false);
+    return;
+  }
+  const selected = projected
+    .filter(s => s.p.playable && pointInPolygon(s.x, s.y, lassoPoints))
+    .map(s => s.p);
+  lassoSelectedIds = new Set(selected.map(p => p.id));
+  if (!selected.length) {
+    playlistMetaEl.classList.remove("busy");
+    playlistMetaEl.textContent = "No playable tracks inside that lasso";
+    lassoMode = false;
+    lassoPoints = [];
+    lassoPlaylistBtn.classList.remove("active");
+    renderPlaylist();
+    needsFrame = true;
+    return;
+  }
+  enqueueTracks(selected, { replace: true, autoplay: true });
+  playlistMetaEl.classList.remove("busy");
+  nowPlayingEl.textContent = `Lasso queued ${selected.length} track${selected.length === 1 ? "" : "s"}`;
+  lassoMode = false;
+  lassoPoints = [];
+  lassoPlaylistBtn.classList.remove("active");
+  updateStats();
+  needsFrame = true;
 }
 
 function draw() {
@@ -747,6 +1851,7 @@ function draw() {
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
     }
     ctx.restore();
+    drawAxisLabels2d(w, h);
   } else {
     drawAxes3d(w, h);
   }
@@ -778,16 +1883,17 @@ function draw() {
     const isSel = p.id === selectedId;
     const isPlay = p.id === playingId;
     const isN = neighborIds.has(p.id);
-    const base = (5.2 + (isHover || isSel || isN ? 2.8 : 0) + (isPlay ? 1.8 : 0)) * (s.rScale || 1);
+    const isLasso = lassoSelectedIds.has(p.id);
+    const base = (5.2 + (isHover || isSel || isN || isLasso ? 2.8 : 0) + (isPlay ? 1.8 : 0)) * (s.rScale || 1);
     const r = Math.max(2.5, base * ease);
     let col = colors[p.modality] || colors.unknown;
     if (isN) col = colors.neighbor;
     const depthFade = mode === "3d" ? Math.max(0.45, Math.min(1, 2.2 / Math.max(0.6, s.depth))) : 1;
 
-    if (isHover || isSel || isPlay || isN) {
+    if (isHover || isSel || isPlay || isN || isLasso) {
       ctx.beginPath();
       ctx.arc(s.x, s.y, r + 6 + (isPlay ? Math.sin(performance.now() / 180) * 1.5 : 0), 0, Math.PI * 2);
-      ctx.strokeStyle = col;
+      ctx.strokeStyle = isLasso ? "rgba(126,200,255,0.95)" : col;
       ctx.globalAlpha = 0.5 * depthFade;
       ctx.lineWidth = 1.5;
       ctx.stroke();
@@ -797,7 +1903,7 @@ function draw() {
     ctx.beginPath();
     ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
     ctx.fillStyle = col;
-    ctx.globalAlpha = ((isHover || isSel || isPlay || isN) ? 1 : 0.92) * depthFade;
+    ctx.globalAlpha = ((isHover || isSel || isPlay || isN || isLasso) ? 1 : 0.92) * depthFade;
     ctx.fill();
     ctx.globalAlpha = 1;
   }
@@ -806,6 +1912,10 @@ function draw() {
     const qs = projectPoint(queryPoint, w, h, pad);
     const pulse = 1 + (playingId ? 0 : Math.sin(performance.now() / 220) * 0.08);
     drawDiamond(qs.x, qs.y, 8 * pulse * ease, colors.query, "rgba(232,165,75,0.9)");
+  }
+
+  if (lassoMode || lassoPoints.length) {
+    drawLasso();
   }
 
   needsFrame = false;
@@ -842,38 +1952,89 @@ function renderPanel(p, kind = "point") {
   }
   if (kind === "query") {
     panelBody.innerHTML = `
-      <span class="pill query">query · ${escapeHtml(p.modality)}</span>
-      <h1>${escapeHtml(p.title)}</h1>
-      <div class="path">${escapeHtml(p.source || p.title)}</div>
-      <p class="empty">White diamond on the map. Blue points are nearest neighbors in embedding space.</p>
+      <div class="selection-card query">
+        <div class="selection-art"></div>
+        <div class="selection-main">
+          <div class="selection-meta">
+            <span class="pill query">query · ${escapeHtml(p.modality)}</span>
+          </div>
+          <h1 class="selection-title">${escapeHtml(p.title)}</h1>
+          <div class="path">${escapeHtml(p.source || p.title)}</div>
+        </div>
+      </div>
     `;
     return;
   }
   const playing = playingId === p.id;
+  const inQueue = playlist.some(track => track.id === p.id);
+  const tags = pointTags(p.id);
+  const primaryLabel = playing && playbackMode === "queue" ? "Stop track" : "Play track";
+  const previewLabel = playing && playbackMode === "preview" ? "Stop preview" : "Preview clip";
+  const queueLabel = inQueue ? "Queued" : "Add to queue";
   panelBody.innerHTML = `
-    <span class="pill ${p.modality}">${p.modality}</span>
-    <h1>${escapeHtml(p.title)}</h1>
-    <div class="path">${escapeHtml(p.source)}</div>
-    <div class="play-row">
-      <button id="play" ${p.playable ? "" : "disabled"} class="${playing ? "playing" : ""}">
-        ${playing ? "Stop" : (p.playable ? "Play preview" : "No file")}
-      </button>
-      <div class="play-meta">${p.playable ? `~${PREVIEW_SEC}s mid-track clip` : "path missing on disk"}</div>
+    <div class="selection-card">
+      <div class="selection-art"></div>
+      <div class="selection-main">
+        <div class="selection-meta">
+          <span class="pill ${p.modality}">${p.modality}</span>
+          ${inQueue ? '<span class="pill query">in queue</span>' : ""}
+        </div>
+        <h1 class="selection-title">${escapeHtml(p.title)}</h1>
+        <div class="path">${escapeHtml(p.source)}</div>
+        <div class="selection-actions">
+          <button id="playFull" class="action primary" ${p.playable ? "" : "disabled"}>${primaryLabel}</button>
+          <button id="playPreview" class="ghost secondary ${playing && playbackMode === "preview" ? "playing" : ""}" ${p.playable ? "" : "disabled"}>${previewLabel}</button>
+          <button id="queueTrack" class="ghost secondary" ${p.playable ? "" : "disabled"}>${queueLabel}</button>
+        </div>
+        <div class="tag-row">
+          ${tags.map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("") || '<span class="selection-status">No tags yet</span>'}
+        </div>
+        <div class="tag-input-row">
+          <input type="text" id="tagInput" placeholder="tag this item, comma separated" value="${escapeHtml(tags.join(", "))}" />
+          <button type="button" class="ghost secondary" id="saveTags">Save tags</button>
+        </div>
+        ${p.playable ? "" : `<div class="selection-status">${p.modality === "image" ? "Visual file on the map" : (p.modality === "text" ? "Text item on the map" : "File missing on disk")}</div>`}
+        <canvas id="selectionWave" class="selection-mini-wave" width="360" height="36"></canvas>
+      </div>
     </div>
-    <canvas id="wave" width="300" height="32"></canvas>
   `;
-  const btn = document.getElementById("play");
-  if (btn && p.playable) {
-    btn.addEventListener("click", (e) => {
+  const previewBtn = document.getElementById("playPreview");
+  const fullBtn = document.getElementById("playFull");
+  const queueBtn = document.getElementById("queueTrack");
+  if (previewBtn && p.playable) {
+    previewBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      togglePlay(p);
+      togglePreview(p);
+    });
+  }
+  if (fullBtn && p.playable) {
+    fullBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleTrackPlay(p);
+    });
+  }
+  if (queueBtn && p.playable) {
+    queueBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      enqueueTracks([p]);
+    });
+  }
+  const saveTagsBtn = document.getElementById("saveTags");
+  const tagInputEl = document.getElementById("tagInput");
+  if (saveTagsBtn && tagInputEl) {
+    saveTagsBtn.addEventListener("click", () => saveTags(p.id, tagInputEl.value));
+    tagInputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        saveTags(p.id, tagInputEl.value);
+      }
     });
   }
   drawWavePlaceholder();
 }
 
 function drawWavePlaceholder() {
-  const wave = document.getElementById("wave");
+  const wave = document.getElementById("wave") || document.getElementById("selectionWave");
   if (!wave) return;
   const wctx = wave.getContext("2d");
   const w = wave.width, h = wave.height;
@@ -885,6 +2046,14 @@ function drawWavePlaceholder() {
   }
 }
 
+function formatTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const whole = Math.floor(seconds);
+  const mins = Math.floor(whole / 60);
+  const secs = whole % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
 function escapeHtml(s) {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -893,38 +2062,469 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;");
 }
 
-function togglePlay(p) {
-  if (playingId === p.id) {
-    stopPlay();
+function playableTracks(points) {
+  const seen = new Set();
+  const tracks = [];
+  for (const p of points || []) {
+    if (!p || !p.playable || seen.has(p.id)) continue;
+    seen.add(p.id);
+    tracks.push(p);
+  }
+  return tracks;
+}
+
+function syncSelection(id) {
+  if (!id) return;
+  const point = byId.get(id);
+  if (point) {
+    selectedId = id;
+    renderPanel(point);
+  }
+}
+
+function currentTrack() {
+  if (playingId) return byId.get(playingId) || null;
+  if (currentQueueIndex >= 0) return playlist[currentQueueIndex] || null;
+  return null;
+}
+
+function updatePlayerChrome() {
+  const track = currentTrack();
+  playerKickerEl.textContent = playbackMode === "preview" ? "Preview clip" : "Player";
+  nowPlayingEl.textContent = track ? track.title : "No track selected";
+  playerSubtitleEl.textContent = track ? track.source : "No track loaded";
+  playerStateEl.textContent = playerStatus;
+  togglePlaylistPlayBtn.innerHTML =
+    playbackMode === "queue" && !player.paused && !player.ended && playingId ? "&#10074;&#10074;" : "&#9654;";
+  shuffleToggleBtn.classList.toggle("active", shuffleMode);
+  repeatToggleBtn.classList.toggle("active", repeatMode);
+  queueToggleBtn.classList.toggle("active", queueDrawerOpen);
+  volumeIconBtn.innerHTML =
+    player.volume <= 0.001 ? "&#128263;" : (player.volume < 0.5 ? "&#128265;" : "&#128266;");
+  if (!playerSeekDragging) {
+    const duration = Number.isFinite(player.duration) ? player.duration : 0;
+    const current = Number.isFinite(player.currentTime) ? player.currentTime : 0;
+    seekBarEl.max = duration > 0 ? String(duration) : "1";
+    seekBarEl.value = String(duration > 0 ? Math.min(current, duration) : 0);
+    currentTimeEl.textContent = formatTime(current);
+    durationTimeEl.textContent = formatTime(duration);
+  }
+  seekBarEl.disabled = !(playbackMode === "queue" && Number.isFinite(player.duration) && player.duration > 0);
+  prevTrackBtn.disabled = playlist.length === 0;
+  nextTrackBtn.disabled = playlist.length === 0;
+}
+
+function setQueueDrawer(open) {
+  queueDrawerOpen = open;
+  queueDrawerEl.hidden = !open;
+  updatePlayerChrome();
+}
+
+function updatePlaylistControls() {
+  const hasTracks = playlist.length > 0;
+  const visiblePlayable = playableTracks(visiblePoints()).length > 0;
+  const hasSeed = !!currentSeedId();
+  prevTrackBtn.disabled = !hasTracks;
+  nextTrackBtn.disabled = !hasTracks;
+  clearPlaylistBtn.disabled = !hasTracks;
+  togglePlaylistPlayBtn.disabled = !hasTracks;
+  queueVisibleBtn.disabled = !visiblePlayable;
+  lassoPlaylistBtn.disabled = !visiblePlayable;
+  playlistMetaEl.textContent = `${playlist.length} track${playlist.length === 1 ? "" : "s"} queued`;
+  queueNeighborsBtn.disabled = !hasSeed;
+  updatePlayerChrome();
+}
+
+async function fetchJson(url, options = {}) {
+  const res = await fetch(url, {
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    ...options,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText || "Request failed");
+  return data;
+}
+
+function renderSavedPlaylists() {
+  savedPlaylistsEl.innerHTML = "";
+  const entries = Object.entries(libraryState.playlists || {});
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "playlist-meta";
+    empty.textContent = "No saved playlists yet";
+    savedPlaylistsEl.appendChild(empty);
     return;
   }
-  stopPlay();
-  playingId = p.id;
-  selectedId = p.id;
-  player.src = `/preview?id=${encodeURIComponent(p.id)}`;
-  player.play().catch(() => stopPlay());
-  renderPanel(p);
+  for (const [name, ids] of entries.sort((a, b) => a[0].localeCompare(b[0]))) {
+    const item = document.createElement("div");
+    item.className = "saved-item";
+    item.innerHTML = `
+      <div>
+        <div class="saved-name">${escapeHtml(name)}</div>
+        <div class="saved-count">${ids.length} track${ids.length === 1 ? "" : "s"}</div>
+      </div>
+      <button type="button" class="ghost">Load</button>
+      <button type="button" class="ghost danger">Delete</button>
+    `;
+    const [loadBtn, deleteBtn] = item.querySelectorAll("button");
+    loadBtn.addEventListener("click", () => {
+      const tracks = ids.map(id => byId.get(id)).filter(Boolean);
+      enqueueTracks(tracks, { replace: true, autoplay: false });
+      playlistMetaEl.textContent = `Loaded ${name}`;
+      playlistNameEl.value = name;
+    });
+    deleteBtn.addEventListener("click", async () => {
+      try {
+        libraryStatusEl.textContent = "Removing playlist…";
+        libraryState = await fetchJson("/api/library/playlist/delete", {
+          method: "POST",
+          body: JSON.stringify({ name }),
+        });
+        renderSavedPlaylists();
+        libraryStatusEl.textContent = `Deleted ${name}`;
+      } catch (err) {
+        libraryStatusEl.textContent = String(err.message || err);
+      }
+    });
+    savedPlaylistsEl.appendChild(item);
+  }
+}
+
+async function loadLibrary() {
+  try {
+    libraryState = await fetchJson("/api/library", { headers: {} });
+    renderSavedPlaylists();
+  } catch (err) {
+    libraryStatusEl.textContent = String(err.message || err);
+  }
+}
+
+async function saveCurrentPlaylist() {
+  if (!playlist.length) {
+    libraryStatusEl.textContent = "Queue a few tracks first";
+    return;
+  }
+  const name = playlistNameEl.value.trim();
+  if (!name) {
+    libraryStatusEl.textContent = "Name the playlist first";
+    return;
+  }
+  try {
+    libraryStatusEl.textContent = "Saving playlist…";
+    libraryState = await fetchJson("/api/library/playlist", {
+      method: "POST",
+      body: JSON.stringify({ name, ids: playlist.map(track => track.id) }),
+    });
+    renderSavedPlaylists();
+    libraryStatusEl.textContent = `Saved ${name}`;
+  } catch (err) {
+    libraryStatusEl.textContent = String(err.message || err);
+  }
+}
+
+function pointTags(pointId) {
+  return libraryState.tags?.[pointId] || [];
+}
+
+async function saveTags(pointId, rawValue) {
+  const tags = rawValue
+    .split(",")
+    .map(part => part.trim())
+    .filter(Boolean);
+  try {
+    libraryState = await fetchJson("/api/library/tags", {
+      method: "POST",
+      body: JSON.stringify({ id: pointId, tags }),
+    });
+    renderSavedPlaylists();
+    renderPanel(byId.get(pointId) || null);
+    libraryStatusEl.textContent = tags.length ? "Tags updated" : "Tags cleared";
+  } catch (err) {
+    libraryStatusEl.textContent = String(err.message || err);
+  }
+}
+
+async function applySemanticAxes() {
+  const requests = [
+    ["x", axisXEl.value.trim()],
+    ["y", axisYEl.value.trim()],
+    ["z", axisZEl.value.trim()],
+  ];
+  const nonEmpty = requests.filter(([, text]) => text);
+  if (!nonEmpty.length) {
+    activeAxes = { x: null, y: null, z: null };
+    renderAxesOverlay();
+    axesStatusEl.textContent = "Axes reset to the original map";
+    needsFrame = true;
+    return;
+  }
+  applyAxesBtn.disabled = true;
+  axesStatusEl.textContent = "Embedding axis phrases…";
+  try {
+    const nextAxes = { x: null, y: null, z: null };
+    for (const [key, text] of requests) {
+      if (!text) continue;
+      nextAxes[key] = await fetchJson("/api/axis", {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      });
+    }
+    activeAxes = nextAxes;
+    renderAxesOverlay();
+    axesStatusEl.textContent = "Semantic axes applied";
+    axesModalEl.hidden = true;
+    needsFrame = true;
+  } catch (err) {
+    axesStatusEl.textContent = String(err.message || err);
+  } finally {
+    applyAxesBtn.disabled = false;
+  }
+}
+
+function clearSemanticAxes() {
+  axisXEl.value = "";
+  axisYEl.value = "";
+  axisZEl.value = "";
+  activeAxes = { x: null, y: null, z: null };
+  renderAxesOverlay();
+  axesStatusEl.textContent = "Axes reset to the original map";
   needsFrame = true;
 }
 
-function stopPlay() {
+function renderPlaylist() {
+  updatePlaylistControls();
+  playlistEl.innerHTML = "";
+  if (!playlist.length) {
+    updatePlayerChrome();
+    return;
+  }
+  const current = currentQueueIndex >= 0 ? playlist[currentQueueIndex] : null;
+  if (!playingId && current) playerStatus = "ready";
+  playlist.forEach((track, index) => {
+    const row = document.createElement("div");
+    row.className = `track${index === currentQueueIndex ? " active" : ""}`;
+    row.innerHTML = `
+      <div class="track-num">${index + 1}</div>
+      <div>
+        <div class="track-title">${escapeHtml(track.title)}</div>
+        <div class="track-sub">${escapeHtml(track.source)}</div>
+      </div>
+      <button type="button" class="ghost">${index === currentQueueIndex && playbackMode === "queue" && playingId === track.id ? "Stop" : "Play"}</button>
+      <button type="button" class="ghost danger">Remove</button>
+    `;
+    row.addEventListener("click", () => {
+      syncSelection(track.id);
+      currentQueueIndex = index;
+      renderPlaylist();
+      needsFrame = true;
+    });
+    const [playBtn, removeBtn] = row.querySelectorAll("button");
+    playBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (index === currentQueueIndex && playbackMode === "queue" && playingId === track.id) stopPlayback();
+      else playQueueIndex(index);
+    });
+    removeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeTrackAt(index);
+    });
+    playlistEl.appendChild(row);
+  });
+  updatePlayerChrome();
+}
+
+function enqueueTracks(tracks, { replace = false, autoplay = false } = {}) {
+  const nextTracks = playableTracks(tracks);
+  if (!nextTracks.length) return;
+  const existing = replace ? [] : playlist.slice();
+  const seen = new Set(existing.map(track => track.id));
+  for (const track of nextTracks) {
+    if (!seen.has(track.id)) {
+      existing.push(track);
+      seen.add(track.id);
+    }
+  }
+  playlist = existing;
+  if (currentQueueIndex < 0 || replace) currentQueueIndex = 0;
+  renderPlaylist();
+  setQueueDrawer(true);
+  if (autoplay) playQueueIndex(currentQueueIndex);
+  else needsFrame = true;
+}
+
+function removeTrackAt(index) {
+  const removed = playlist[index];
+  if (!removed) return;
+  const wasCurrent = index === currentQueueIndex;
+  playlist.splice(index, 1);
+  if (!playlist.length) {
+    currentQueueIndex = -1;
+    if (playingId === removed.id) stopPlayback({ preserveQueue: false });
+  } else if (wasCurrent) {
+    currentQueueIndex = Math.min(index, playlist.length - 1);
+    if (playingId === removed.id && playbackMode === "queue") {
+      stopPlayback({ preserveQueue: true });
+      playQueueIndex(currentQueueIndex);
+      return;
+    }
+  } else if (index < currentQueueIndex) {
+    currentQueueIndex -= 1;
+  }
+  renderPlaylist();
+  renderPanel(byId.get(selectedId) || null);
+}
+
+function togglePreview(p) {
+  if (playingId === p.id && playbackMode === "preview") {
+    stopPlayback();
+    return;
+  }
+  stopPlayback({ preserveQueue: true });
+  playbackMode = "preview";
+  playerStatus = "loading";
+  playingId = p.id;
+  selectedId = p.id;
+  player.src = `/preview?id=${encodeURIComponent(p.id)}`;
+  player.load();
+  player.play().catch(() => {
+    playerStatus = "blocked";
+    stopPlayback({ preserveQueue: true });
+  });
+  renderPanel(p);
+  renderPlaylist();
+  needsFrame = true;
+}
+
+function playQueueIndex(index) {
+  const track = playlist[index];
+  if (!track) return;
+  stopPlayback({ preserveQueue: true });
+  playbackMode = "queue";
+  playerStatus = "loading";
+  currentQueueIndex = index;
+  playingId = track.id;
+  selectedId = track.id;
+  player.src = `/audio?id=${encodeURIComponent(track.id)}`;
+  player.load();
+  player.play().catch(() => {
+    playerStatus = "blocked";
+    stopPlayback({ preserveQueue: true });
+  });
+  renderPanel(track);
+  renderPlaylist();
+  needsFrame = true;
+}
+
+function toggleTrackPlay(track) {
+  const existingIndex = playlist.findIndex(item => item.id === track.id);
+  if (existingIndex >= 0) {
+    if (playingId === track.id && playbackMode === "queue") {
+      stopPlayback({ preserveQueue: true });
+      renderPlaylist();
+      return;
+    }
+    playQueueIndex(existingIndex);
+    return;
+  }
+  currentQueueIndex = playlist.findIndex(item => item.id === track.id);
+  enqueueTracks([track]);
+  currentQueueIndex = playlist.findIndex(item => item.id === track.id);
+  if (currentQueueIndex >= 0) playQueueIndex(currentQueueIndex);
+}
+
+function stopPlayback({ preserveQueue = true } = {}) {
   player.pause();
   player.removeAttribute("src");
   player.load();
   playingId = null;
-  const p = POINTS.find(x => x.id === selectedId) || POINTS.find(x => x.id === hoverId);
+  playerStatus = preserveQueue && playlist.length ? "paused" : "idle";
+  if (!preserveQueue) {
+    playbackMode = null;
+    currentQueueIndex = -1;
+  } else if (playbackMode === "preview") {
+    playbackMode = null;
+  }
+  const p = byId.get(selectedId) || byId.get(hoverId);
   renderPanel(p || null);
+  renderPlaylist();
   needsFrame = true;
 }
 
-player.addEventListener("ended", stopPlay);
+function playNext(step = 1) {
+  if (!playlist.length) return;
+  if (repeatMode && playingId && step === 1) {
+    playQueueIndex(currentQueueIndex >= 0 ? currentQueueIndex : 0);
+    return;
+  }
+  if (shuffleMode && playlist.length > 1) {
+    let next = currentQueueIndex;
+    while (next === currentQueueIndex) {
+      next = Math.floor(Math.random() * playlist.length);
+    }
+    playQueueIndex(next);
+    return;
+  }
+  const base = currentQueueIndex >= 0 ? currentQueueIndex : 0;
+  const next = (base + step + playlist.length) % playlist.length;
+  playQueueIndex(next);
+}
+
+player.addEventListener("ended", () => {
+  playerStatus = "ended";
+  if (playbackMode === "queue" && playlist.length) {
+    playNext(1);
+    return;
+  }
+  stopPlayback({ preserveQueue: true });
+});
+player.addEventListener("play", () => {
+  playerStatus = playbackMode === "preview" ? "previewing" : "playing";
+  updatePlayerChrome();
+});
+player.addEventListener("pause", () => {
+  if (playingId) playerStatus = "paused";
+  updatePlayerChrome();
+});
+player.addEventListener("waiting", () => {
+  if (playingId) playerStatus = "buffering";
+  updatePlayerChrome();
+});
+player.addEventListener("canplay", () => {
+  if (playingId && playerStatus !== "playing") playerStatus = "ready";
+  updatePlayerChrome();
+});
+player.addEventListener("loadedmetadata", updatePlayerChrome);
+player.addEventListener("timeupdate", updatePlayerChrome);
 player.addEventListener("error", () => {
   if (playingId) {
-    stopPlay();
+    playerStatus = "error";
+    stopPlayback({ preserveQueue: true });
     panelBody.insertAdjacentHTML("beforeend",
-      `<p class="empty" style="color:var(--danger)">Could not decode preview. Is ffmpeg installed?</p>`);
+      `<p class="empty" style="color:var(--danger)">Could not decode audio. Is ffmpeg installed?</p>`);
   }
 });
+seekBarEl.addEventListener("input", () => {
+  playerSeekDragging = true;
+  currentTimeEl.textContent = formatTime(Number(seekBarEl.value));
+});
+seekBarEl.addEventListener("change", () => {
+  const next = Number(seekBarEl.value);
+  if (Number.isFinite(next) && playbackMode === "queue") player.currentTime = next;
+  playerSeekDragging = false;
+  updatePlayerChrome();
+});
+volumeBarEl.addEventListener("input", () => {
+  player.volume = Number(volumeBarEl.value);
+  updatePlayerChrome();
+});
+volumeIconBtn.addEventListener("click", () => {
+  if (player.volume <= 0.001) player.volume = 1;
+  else player.volume = 0;
+  volumeBarEl.value = String(player.volume);
+  updatePlayerChrome();
+});
+applyAxesBtn.addEventListener("click", applySemanticAxes);
+clearAxesBtn.addEventListener("click", clearSemanticAxes);
 
 function markInteract() {
   if (autoOrbit) {
@@ -934,10 +2534,21 @@ function markInteract() {
 
 canvas.addEventListener("mousemove", (e) => {
   if (drag) {
+    if (drag.lasso) {
+      const rect = canvas.getBoundingClientRect();
+      lassoPoints.push({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+      needsFrame = true;
+      return;
+    }
     markInteract();
     if (mode === "3d") {
-      cam3.yaw += e.movementX * 0.008;
-      cam3.pitch = Math.max(-1.2, Math.min(1.2, cam3.pitch + e.movementY * 0.008));
+      if (drag.pan3d) {
+        cam3.panX -= e.movementX * 0.0019;
+        cam3.panY += e.movementY * 0.0019;
+      } else {
+        cam3.yaw += e.movementX * 0.008;
+        cam3.pitch = Math.max(-1.2, Math.min(1.2, cam3.pitch + e.movementY * 0.008));
+      }
     } else {
       view.x += e.movementX;
       view.y += e.movementY;
@@ -951,7 +2562,7 @@ canvas.addEventListener("mousemove", (e) => {
   if (next !== hoverId) {
     hoverId = next;
     if (hit) renderPanel(hit.point, hit.kind);
-    else if (!playingId) renderPanel(selectedId ? POINTS.find(p => p.id === selectedId) : null);
+    else if (!playingId) renderPanel(selectedId ? byId.get(selectedId) : null);
     canvas.style.cursor = hit ? "pointer" : (mode === "3d" ? "grab" : "crosshair");
     needsFrame = true;
   }
@@ -959,15 +2570,26 @@ canvas.addEventListener("mousemove", (e) => {
 
 canvas.addEventListener("mouseleave", () => {
   hoverId = null;
+  if (drag && drag.lasso) return;
   if (!playingId) {
-    renderPanel(selectedId ? POINTS.find(p => p.id === selectedId) : null);
+    renderPanel(selectedId ? byId.get(selectedId) : null);
   }
   needsFrame = true;
 });
 
 canvas.addEventListener("mousedown", (e) => {
+  if (lassoMode && e.button === 0) {
+    const rect = canvas.getBoundingClientRect();
+    lassoPoints = [{ x: e.clientX - rect.left, y: e.clientY - rect.top }];
+    lassoSelectedIds = new Set();
+    drag = { active: true, moved: true, lasso: true };
+    canvas.style.cursor = "crosshair";
+    e.preventDefault();
+    needsFrame = true;
+    return;
+  }
   if (e.button === 1 || e.button === 2 || e.altKey || e.shiftKey) {
-    drag = { active: true, moved: true };
+    drag = { active: true, moved: true, pan3d: mode === "3d" };
     canvas.style.cursor = "grabbing";
     e.preventDefault();
     return;
@@ -979,15 +2601,18 @@ window.addEventListener("mouseup", (e) => {
   if (!drag) return;
   const wasDrag = drag;
   drag = null;
-  canvas.style.cursor = mode === "3d" ? "grab" : "crosshair";
+  canvas.style.cursor = lassoMode ? "crosshair" : (mode === "3d" ? "grab" : "crosshair");
+  if (wasDrag.lasso) {
+    finalizeLasso();
+    return;
+  }
   if (wasDrag.moved) return;
   const rect = canvas.getBoundingClientRect();
   const hit = hitTest(e.clientX - rect.left, e.clientY - rect.top);
   if (hit && hit.kind === "point") {
     selectedId = hit.point.id;
     renderPanel(hit.point);
-    if (hit.point.playable) togglePlay(hit.point);
-    else needsFrame = true;
+    needsFrame = true;
   } else if (hit && hit.kind === "query") {
     renderPanel(hit.point, "query");
   }
@@ -1039,7 +2664,8 @@ function renderNeighbors(neighbors) {
         <div class="ntitle">${escapeHtml(n.title)}</div>
         <div class="nmeta">${escapeHtml(n.modality)}${n.playable ? " · click to play" : ""}</div>
       </div>
-      <button type="button" class="ghost" ${n.playable ? "" : "disabled"}>${n.playable ? "▶" : "·"}</button>
+      <button type="button" class="ghost" ${n.playable ? "" : "disabled"}>${n.playable ? "Play" : "·"}</button>
+      <button type="button" class="ghost" ${n.playable ? "" : "disabled"}>${n.playable ? "+Q" : "·"}</button>
     `;
     row.addEventListener("click", () => {
       selectedId = n.id;
@@ -1048,15 +2674,20 @@ function renderNeighbors(neighbors) {
       renderPanel(n);
       needsFrame = true;
     });
-    const playBtn = row.querySelector("button");
+    const [playBtn, queueBtn] = row.querySelectorAll("button");
     if (n.playable) {
       playBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        togglePlay(n);
+        toggleTrackPlay(n);
+      });
+      queueBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        enqueueTracks([n]);
       });
     }
     neighborsEl.appendChild(row);
   }
+  updatePlaylistControls();
 }
 
 function clearQuery() {
@@ -1070,7 +2701,92 @@ function clearQuery() {
   needsFrame = true;
 }
 
+async function queueNeighborsFromSelection() {
+  const seedId = currentSeedId();
+  if (!seedId) {
+    playlistMetaEl.textContent = "Select or play a song first";
+    return;
+  }
+  queueNeighborsBtn.disabled = true;
+  neighborsGoBtn.disabled = true;
+  neighborsGoBtn.textContent = "Loading…";
+  try {
+    const requested = Math.max(2, Math.min(50, Number(neighborsCountEl.value || 5)));
+    const chain = neighborsChainEl.checked ? "1" : "0";
+    const count = neighborsChainEl.checked ? requested : Math.max(1, requested - 1);
+    const res = await fetch(
+      `/api/neighbors?id=${encodeURIComponent(seedId)}&top_k=${count}&chain=${chain}`
+    );
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    neighborIds = new Set(data.neighbors.map(n => n.id));
+    renderNeighbors(data.neighbors);
+    enqueueTracks(data.neighbors, { replace: true, autoplay: true });
+    setNeighborsPopover(false);
+  } catch (err) {
+    playlistMetaEl.textContent = String(err.message || err);
+  } finally {
+    neighborsGoBtn.disabled = false;
+    neighborsGoBtn.textContent = "Build";
+    updatePlaylistControls();
+  }
+}
+
 clearQueryBtn.addEventListener("click", clearQuery);
+savePlaylistBtn.addEventListener("click", saveCurrentPlaylist);
+playlistNameEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    saveCurrentPlaylist();
+  }
+});
+queueVisibleBtn.addEventListener("click", () => {
+  enqueueTracks(visiblePoints(), { replace: true, autoplay: true });
+});
+queueNeighborsBtn.addEventListener("click", () => {
+  setQueueDrawer(true);
+  closeTransientPanels({ keep: "neighbors" });
+  setNeighborsPopover(neighborsPopoverEl.hidden);
+});
+neighborsGoBtn.addEventListener("click", queueNeighborsFromSelection);
+neighborsCancelBtn.addEventListener("click", () => setNeighborsPopover(false));
+neighborsCountEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !neighborsGoBtn.disabled) queueNeighborsFromSelection();
+});
+lassoPlaylistBtn.addEventListener("click", () => {
+  setLassoMode(!lassoMode);
+});
+queueToggleBtn.addEventListener("click", () => {
+  setQueueDrawer(!queueDrawerOpen);
+});
+closeQueueBtn.addEventListener("click", () => {
+  setQueueDrawer(false);
+  setNeighborsPopover(false);
+});
+clearPlaylistBtn.addEventListener("click", () => {
+  playlist = [];
+  lassoSelectedIds = new Set();
+  stopPlayback({ preserveQueue: false });
+  renderPlaylist();
+});
+prevTrackBtn.addEventListener("click", () => playNext(-1));
+nextTrackBtn.addEventListener("click", () => playNext(1));
+shuffleToggleBtn.addEventListener("click", () => {
+  shuffleMode = !shuffleMode;
+  updatePlayerChrome();
+});
+repeatToggleBtn.addEventListener("click", () => {
+  repeatMode = !repeatMode;
+  updatePlayerChrome();
+});
+togglePlaylistPlayBtn.addEventListener("click", () => {
+  if (!playlist.length) return;
+  if (playbackMode === "queue" && playingId) {
+    stopPlayback({ preserveQueue: true });
+    return;
+  }
+  playQueueIndex(currentQueueIndex >= 0 ? currentQueueIndex : 0);
+});
 
 async function placeQuery() {
   if (queryBusy) return;
@@ -1124,7 +2840,8 @@ function updateStats() {
   const audio = POINTS.filter(p => p.modality === "audio").length;
   const vis = visiblePoints().length;
   const dim = mode === "3d" ? "UMAP 3D" : "UMAP 2D";
-  statsEl.textContent = `${vis} shown · ${audio} audio · ${all} total · ${dim}`;
+  const lasso = lassoSelectedIds.size ? ` · ${lassoSelectedIds.size} lassoed` : "";
+  statsEl.textContent = `${vis} shown · ${audio} audio · ${all} total · ${dim}${lasso}`;
 }
 
 function loop() {
@@ -1138,15 +2855,48 @@ function loop() {
 
 window.addEventListener("resize", resize);
 window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !axesModalEl.hidden) {
+    axesModalEl.hidden = true;
+    return;
+  }
+  if (e.key === "Escape" && !infoModalEl.hidden) {
+    infoModalEl.hidden = true;
+    return;
+  }
+  if (e.key === "Escape" && !neighborsPopoverEl.hidden) {
+    setNeighborsPopover(false);
+    return;
+  }
+  if (e.key === "Escape" && queueDrawerOpen) {
+    setQueueDrawer(false);
+    return;
+  }
   if (e.key === "2") setMode("2d");
   if (e.key === "3") setMode("3d");
-  if (e.key === " " && playingId && document.activeElement !== queryTextEl) {
+  if (e.key.toLowerCase() === "l" && document.activeElement !== queryTextEl) {
     e.preventDefault();
-    stopPlay();
+    setLassoMode(!lassoMode);
   }
+  if (e.key === "Escape" && lassoMode) {
+    e.preventDefault();
+    setLassoMode(false);
+  }
+  if (e.key === " " && document.activeElement !== queryTextEl) {
+    e.preventDefault();
+    if (playbackMode === "queue" && playlist.length && !playingId) {
+      playQueueIndex(currentQueueIndex >= 0 ? currentQueueIndex : 0);
+    } else if (playingId) {
+      stopPlayback({ preserveQueue: true });
+    }
+  }
+  if (e.key === "ArrowRight" && playbackMode === "queue") playNext(1);
+  if (e.key === "ArrowLeft" && playbackMode === "queue") playNext(-1);
 });
 
 updateStats();
+renderPlaylist();
+renderAxesOverlay();
+loadLibrary();
 resize();
 draw();
 requestAnimationFrame(loop);
@@ -1219,7 +2969,91 @@ def _ffmpeg_preview(path: str) -> bytes:
     return proc.stdout
 
 
-def make_handler(index: MapIndex, html: str):
+def _stream_ffmpeg_audio(handler: BaseHTTPRequestHandler, path: str) -> None:
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                path,
+                "-vn",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+                "-f",
+                "mp3",
+                "-q:a",
+                "3",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg not found for full-track playback") from exc
+
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    handler.send_response(200)
+    handler.send_header("Content-Type", "audio/mpeg")
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    try:
+        while True:
+            chunk = proc.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            handler.wfile.write(chunk)
+    except BrokenPipeError:
+        pass
+    finally:
+        stderr = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[:400]
+        code = proc.wait(timeout=10)
+        if code != 0 and stderr:
+            print(f"stream failed for {path}: {stderr}", flush=True)
+
+
+def _send_audio_file(handler: BaseHTTPRequestHandler, path: str) -> None:
+    file_size = os.path.getsize(path)
+    content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    range_header = handler.headers.get("Range")
+    start = 0
+    end = file_size - 1
+    status = 200
+    if range_header and range_header.startswith("bytes="):
+        spec = range_header.split("=", 1)[1]
+        start_s, _, end_s = spec.partition("-")
+        if start_s:
+            start = max(0, min(int(start_s), file_size - 1))
+        if end_s:
+            end = max(start, min(int(end_s), file_size - 1))
+        status = 206
+    length = max(0, end - start + 1)
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Accept-Ranges", "bytes")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(length))
+    if status == 206:
+        handler.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+    handler.end_headers()
+    with open(path, "rb") as f:
+        f.seek(start)
+        remaining = length
+        while remaining > 0:
+            chunk = f.read(min(64 * 1024, remaining))
+            if not chunk:
+                break
+            handler.wfile.write(chunk)
+            remaining -= len(chunk)
+
+
+def make_handler(index: MapIndex, html: str, library: LibraryState):
     by_id = index._by_id
 
     class Handler(BaseHTTPRequestHandler):
@@ -1251,6 +3085,35 @@ def make_handler(index: MapIndex, html: str):
                 self._send_json({"points": index.points})
                 return
 
+            if parsed.path == "/api/neighbors":
+                qs = parse_qs(parsed.query)
+                pid = (qs.get("id") or [None])[0]
+                top_k_raw = (qs.get("top_k") or [str(DEFAULT_NEIGHBORS)])[0]
+                chain_raw = (qs.get("chain") or ["0"])[0]
+                if not pid:
+                    self._send_json({"error": "Missing id"}, 400)
+                    return
+                try:
+                    top_k = max(1, min(50, int(top_k_raw)))
+                except ValueError:
+                    self._send_json({"error": "Invalid top_k"}, 400)
+                    return
+                chain = chain_raw in {"1", "true", "yes", "on"}
+                try:
+                    if chain:
+                        neighbors = index.chain_for_id(pid, count=top_k)
+                    else:
+                        neighbors = index.nearest_for_id(pid, top_k=top_k, include_self=False)
+                except KeyError:
+                    self._send_json({"error": "Unknown id"}, 404)
+                    return
+                self._send_json({"neighbors": neighbors})
+                return
+
+            if parsed.path == "/api/library":
+                self._send_json(library.snapshot())
+                return
+
             if parsed.path == "/preview":
                 qs = parse_qs(parsed.query)
                 pid = (qs.get("id") or [None])[0]
@@ -1280,10 +3143,102 @@ def make_handler(index: MapIndex, html: str):
                 self.wfile.write(data)
                 return
 
+            if parsed.path == "/audio":
+                qs = parse_qs(parsed.query)
+                pid = (qs.get("id") or [None])[0]
+                point = by_id.get(pid) if pid else None
+                if not point or not point.get("playable"):
+                    self.send_error(404, "Not playable")
+                    return
+                source = point["source"]
+                if not os.path.isfile(source):
+                    self.send_error(404, "File missing")
+                    return
+                try:
+                    _send_audio_file(self, source)
+                except Exception as exc:
+                    msg = str(exc).encode("utf-8")
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(msg)))
+                    self.end_headers()
+                    self.wfile.write(msg)
+                return
+
             self.send_error(404, "Not found")
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            if parsed.path == "/api/axis":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "Invalid JSON"}, 400)
+                    return
+                try:
+                    phrase = str(payload.get("text") or "")
+                    self._send_json(index.semantic_axis(phrase))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if parsed.path == "/api/library/playlist":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "Invalid JSON"}, 400)
+                    return
+                try:
+                    snapshot = library.save_playlist(
+                        str(payload.get("name") or ""),
+                        list(payload.get("ids") or []),
+                    )
+                    self._send_json(snapshot)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if parsed.path == "/api/library/playlist/delete":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "Invalid JSON"}, 400)
+                    return
+                try:
+                    snapshot = library.delete_playlist(str(payload.get("name") or ""))
+                    self._send_json(snapshot)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if parsed.path == "/api/library/tags":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "Invalid JSON"}, 400)
+                    return
+                try:
+                    snapshot = library.set_tags(
+                        str(payload.get("id") or ""),
+                        list(payload.get("tags") or []),
+                    )
+                    self._send_json(snapshot)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
             if parsed.path != "/api/query":
                 self.send_error(404, "Not found")
                 return
@@ -1358,13 +3313,14 @@ def run_server(
     preload_model: bool = False,
 ) -> None:
     index = MapIndex(db_path, collection)
+    library = LibraryState(str(Path(db_path) / ".anyembed_library.json"))
     if preload_model:
         index.get_embedder()
     html = (
         HTML_PAGE.replace("__POINTS_JSON__", json.dumps(index.points))
         .replace("__PREVIEW_SECONDS__", str(PREVIEW_SECONDS))
     )
-    handler = make_handler(index, html)
+    handler = make_handler(index, html, library)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     url = f"http://127.0.0.1:{port}/"
     print(f"map ready → {url}", flush=True)
