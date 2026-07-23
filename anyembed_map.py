@@ -224,6 +224,30 @@ class MapIndex:
             current_id = next_point["id"]
         return chain
 
+    def semantic_axis(self, text: str) -> dict[str, Any]:
+        import numpy as np
+
+        label = text.strip()
+        if not label:
+            raise ValueError("Axis phrase required")
+        embedder = self.get_embedder()
+        embedding = embedder.embed(label, modality="text")
+        vec = _l2_normalize(np.asarray(embedding, dtype=np.float32).reshape(1, -1))[0]
+        sims = self.embeddings @ vec
+        order = np.argsort(sims)
+        ranks = np.empty(len(order), dtype=np.float32)
+        if len(order) == 1:
+            ranks[order[0]] = 0.5
+        else:
+            ranks[order] = np.linspace(0.0, 1.0, len(order), dtype=np.float32)
+        return {
+            "label": label,
+            "scores": {
+                self.points[i]["id"]: float(ranks[i])
+                for i in range(len(self.points))
+            },
+        }
+
     def get_embedder(self):
         with self._embedder_lock:
             if self._embedder is None:
@@ -925,6 +949,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-bottom: 1px solid var(--line);
   }
   .queue-header .spacer { flex: 1; }
+  .queue-library {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(240px, 360px);
+    gap: 0.9rem;
+    padding: 0.9rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .queue-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    min-width: 0;
+  }
   .popover {
     position: absolute;
     right: 1rem;
@@ -938,6 +975,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.15)),
       var(--bg-elev);
     box-shadow: 0 16px 36px rgba(0,0,0,0.34);
+  }
+  .popover.inline {
+    position: static;
+    width: 100%;
+    margin-top: 0.2rem;
+    box-shadow: none;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.02);
   }
   .popover[hidden] { display: none; }
   .popover .row {
@@ -1068,7 +1113,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     display: flex;
     flex-direction: column;
     gap: 0.38rem;
-    max-height: 18vh;
+    max-height: 24vh;
     overflow: auto;
   }
   .saved-item {
@@ -1115,6 +1160,82 @@ HTML_PAGE = r"""<!DOCTYPE html>
     box-shadow: 0 18px 40px rgba(0,0,0,0.34);
   }
   .info-modal[hidden] { display: none; }
+  .axes-modal {
+    position: fixed;
+    left: 1rem;
+    top: 4.2rem;
+    width: min(360px, calc(100vw - 2rem));
+    z-index: 5;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 0.9rem;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.16)),
+      var(--bg-elev);
+    box-shadow: 0 18px 40px rgba(0,0,0,0.34);
+  }
+  .axes-modal[hidden] { display: none; }
+  .axes-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.55rem;
+    align-items: center;
+    margin-top: 0.65rem;
+  }
+  .axes-grid .label {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.66rem;
+    color: var(--muted);
+  }
+  .axes-grid input {
+    width: 100%;
+    min-width: 0;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 10px;
+    padding: 0.5rem 0.65rem;
+    font: 500 0.8rem "Instrument Sans", sans-serif;
+    outline: none;
+  }
+  .axes-grid input:focus { border-color: var(--accent-dim); }
+  .axes-actions {
+    display: flex;
+    gap: 0.45rem;
+    margin-top: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .axes-status {
+    min-height: 1em;
+    margin-top: 0.55rem;
+    color: var(--muted);
+    font: 0.66rem "JetBrains Mono", monospace;
+  }
+  .axes-overlay {
+    position: absolute;
+    left: 1rem;
+    bottom: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.32rem;
+    pointer-events: none;
+    z-index: 2;
+  }
+  .axis-chip {
+    width: fit-content;
+    max-width: min(320px, calc(100vw - 4rem));
+    padding: 0.32rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(18,16,14,0.78);
+    color: var(--muted);
+    font: 0.64rem "JetBrains Mono", monospace;
+    letter-spacing: 0.02em;
+  }
+  .axis-chip strong {
+    color: var(--ink);
+    font-weight: 600;
+  }
   .info-grid {
     display: grid;
     grid-template-columns: auto 1fr;
@@ -1152,6 +1273,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .volume-wrap { min-width: 92px; }
     .volume-wrap input[type="range"] { width: 58px; }
     .queue-header { flex-wrap: wrap; }
+    .queue-library { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -1167,6 +1289,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
       <label class="tog spin-tog" id="spinLabel"><input type="checkbox" id="spin" /> spin</label>
       <label class="tog"><input type="checkbox" id="audioOnly" checked /> audio only</label>
+      <button type="button" class="toolbar-btn" id="axesToggle">Axes</button>
       <button type="button" class="toolbar-btn icon-btn" id="infoToggle" aria-label="Info">i</button>
       <button type="button" class="toolbar-btn" id="resetView">Reset view</button>
       <input type="search" id="q" placeholder="Filter by title…" autocomplete="off" />
@@ -1175,6 +1298,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div id="stage-wrap">
     <canvas id="stage"></canvas>
     <div id="hint">scroll zoom · drag pan · click play · hover for info</div>
+    <div class="axes-overlay" id="axesOverlay"></div>
   </div>
   <aside id="panel">
     <div class="eyebrow">selection</div>
@@ -1202,14 +1326,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <div class="section">
       <div class="eyebrow">library</div>
-      <div class="playlist-save-row">
-        <input type="text" id="playlistName" placeholder="Name this playlist…" />
-        <button type="button" class="ghost" id="savePlaylist">Save queue</button>
-      </div>
-      <div class="playlist-meta" id="libraryStatus">Saved playlists stay local to this DB.</div>
-      <div class="saved-list" id="savedPlaylists"></div>
+      <div class="playlist-meta" id="libraryStatus">Saved playlists and tags stay local to this DB.</div>
     </div>
   </aside>
+</div>
+<div class="axes-modal" id="axesModal" hidden>
+  <div class="eyebrow">semantic axes</div>
+  <div class="axes-grid">
+    <span class="label">x</span>
+    <input type="text" id="axisX" placeholder="e.g. dreamy" />
+    <span class="label">y</span>
+    <input type="text" id="axisY" placeholder="e.g. PUNK" />
+    <span class="label">z</span>
+    <input type="text" id="axisZ" placeholder="3D only, e.g. noisy" />
+  </div>
+  <div class="axes-actions">
+    <button type="button" class="action" id="applyAxes">Apply</button>
+    <button type="button" class="ghost" id="clearAxes">Reset</button>
+  </div>
+  <div class="axes-status" id="axesStatus">Set one or more phrases to bend the map around your own meanings.</div>
 </div>
 <div class="info-modal" id="infoModal" hidden>
   <div class="eyebrow">info</div>
@@ -1237,23 +1372,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button type="button" class="ghost danger" id="clearPlaylist">Clear</button>
       <button type="button" class="ghost icon-btn" id="closeQueue" aria-label="Close queue">&#10005;</button>
     </div>
+    <div class="queue-library">
+      <div class="queue-pane">
+        <div class="eyebrow">save queue</div>
+        <div class="playlist-save-row">
+          <input type="text" id="playlistName" placeholder="Name this playlist…" />
+          <button type="button" class="ghost" id="savePlaylist">Save</button>
+        </div>
+        <div class="playlist-meta">Save the current queue as a reusable playlist.</div>
+        <div class="popover inline" id="neighborsPopover" hidden>
+          <div class="eyebrow">neighbors</div>
+          <div class="row">
+            <label class="label" for="neighborsCount">songs</label>
+            <input type="number" id="neighborsCount" min="2" max="50" step="1" value="5" />
+          </div>
+          <div class="row">
+            <label class="tog"><input type="checkbox" id="neighborsChain" /> chain</label>
+          </div>
+          <div class="row">
+            <button type="button" class="action" id="neighborsGo">Build</button>
+            <button type="button" class="ghost" id="neighborsCancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+      <div class="queue-pane">
+        <div class="eyebrow">saved playlists</div>
+        <div class="saved-list" id="savedPlaylists"></div>
+      </div>
+    </div>
     <div class="playlist" id="playlist"></div>
   </div>
-</div>
-<div class="popover" id="neighborsPopover" hidden>
-  <div class="eyebrow">neighbors</div>
-  <div class="row">
-    <label class="label" for="neighborsCount">songs</label>
-    <input type="number" id="neighborsCount" min="2" max="50" step="1" value="5" />
-  </div>
-  <div class="row">
-    <label class="tog"><input type="checkbox" id="neighborsChain" /> chain</label>
-  </div>
-  <div class="row">
-    <button type="button" class="action" id="neighborsGo">Build</button>
-    <button type="button" class="ghost" id="neighborsCancel">Cancel</button>
-  </div>
-  <div class="hint">Regular mode pulls the closest songs to the selected track. Chain mode keeps stepping outward from the last added song without repeats.</div>
 </div>
 <div id="player-dock">
   <div class="player-shell">
@@ -1322,6 +1470,15 @@ const spinLabel = document.getElementById("spinLabel");
 const hintEl = document.getElementById("hint");
 const mode2dBtn = document.getElementById("mode2d");
 const mode3dBtn = document.getElementById("mode3d");
+const axesToggleBtn = document.getElementById("axesToggle");
+const axesModalEl = document.getElementById("axesModal");
+const axesOverlayEl = document.getElementById("axesOverlay");
+const axisXEl = document.getElementById("axisX");
+const axisYEl = document.getElementById("axisY");
+const axisZEl = document.getElementById("axisZ");
+const applyAxesBtn = document.getElementById("applyAxes");
+const clearAxesBtn = document.getElementById("clearAxes");
+const axesStatusEl = document.getElementById("axesStatus");
 const infoToggleBtn = document.getElementById("infoToggle");
 const infoModalEl = document.getElementById("infoModal");
 const resetViewBtn = document.getElementById("resetView");
@@ -1361,6 +1518,10 @@ const togglePlaylistPlayBtn = document.getElementById("togglePlaylistPlay");
 const queueToggleBtn = document.getElementById("queueToggle");
 const playlistMetaEl = document.getElementById("playlistMeta");
 const playlistEl = document.getElementById("playlist");
+const playlistNameEl = document.getElementById("playlistName");
+const savePlaylistBtn = document.getElementById("savePlaylist");
+const savedPlaylistsEl = document.getElementById("savedPlaylists");
+const libraryStatusEl = document.getElementById("libraryStatus");
 
 let mode = "2d";
 let hoverId = null;
@@ -1387,6 +1548,8 @@ let playerStatus = "idle";
 let shuffleMode = false;
 let repeatMode = false;
 let queueDrawerOpen = false;
+let activeAxes = { x: null, y: null, z: null };
+let libraryState = { playlists: {}, tags: {} };
 
 function currentSeedId() {
   return selectedId || playingId || (currentTrack() && currentTrack().id) || null;
@@ -1399,12 +1562,43 @@ function setNeighborsPopover(open) {
   neighborsGoBtn.disabled = !hasSeed;
   neighborsCountEl.disabled = !hasSeed;
   neighborsChainEl.disabled = !hasSeed;
-  if (open && !hasSeed) {
-    playlistMetaEl.textContent = "Select or play a song first";
+  if (open) {
+    playlistMetaEl.textContent = hasSeed
+      ? "Pick how many nearby songs to pull into the queue"
+      : "Select or play a song first";
   }
 }
 
 const byId = new Map(POINTS.map(p => [p.id, p]));
+
+function semanticCoord(axisKey, point, fallback) {
+  const axis = activeAxes[axisKey];
+  if (!axis || !axis.scores) return fallback;
+  const score = axis.scores[point.id];
+  return Number.isFinite(score) ? score : fallback;
+}
+
+function activeAxisEntries() {
+  return Object.entries(activeAxes).filter(([, axis]) => axis && axis.label);
+}
+
+function renderAxesOverlay() {
+  const entries = activeAxisEntries();
+  axesOverlayEl.innerHTML = "";
+  axesOverlayEl.hidden = entries.length === 0;
+  for (const [key, axis] of entries) {
+    const chip = document.createElement("div");
+    chip.className = "axis-chip";
+    chip.innerHTML = `<strong>${key.toUpperCase()}</strong> least ${escapeHtml(axis.label)} <span style="color:var(--accent)">→</span> most ${escapeHtml(axis.label)}`;
+    axesOverlayEl.appendChild(chip);
+  }
+}
+
+function closeTransientPanels({ keep = null } = {}) {
+  if (keep !== "axes") axesModalEl.hidden = true;
+  if (keep !== "info") infoModalEl.hidden = true;
+  if (keep !== "neighbors") setNeighborsPopover(false);
+}
 
 function visiblePoints() {
   const q = qEl.value.trim().toLowerCase();
@@ -1440,8 +1634,15 @@ function resetView() {
 
 mode2dBtn.addEventListener("click", () => setMode("2d"));
 mode3dBtn.addEventListener("click", () => setMode("3d"));
+axesToggleBtn.addEventListener("click", () => {
+  const nextOpen = axesModalEl.hidden;
+  closeTransientPanels({ keep: nextOpen ? "axes" : null });
+  axesModalEl.hidden = !nextOpen;
+});
 infoToggleBtn.addEventListener("click", () => {
-  infoModalEl.hidden = !infoModalEl.hidden;
+  const nextOpen = infoModalEl.hidden;
+  closeTransientPanels({ keep: nextOpen ? "info" : null });
+  infoModalEl.hidden = !nextOpen;
 });
 resetViewBtn.addEventListener("click", resetView);
 spinEl.addEventListener("change", () => {
@@ -1465,18 +1666,20 @@ function resize() {
 function project2d(p, w, h, pad) {
   const usableW = w - pad * 2;
   const usableH = h - pad * 2;
+  const px = semanticCoord("x", p, p.x);
+  const py = semanticCoord("y", p, p.y);
   return {
-    x: pad + p.x * usableW * view.scale + view.x,
-    y: pad + (1 - p.y) * usableH * view.scale + view.y,
+    x: pad + px * usableW * view.scale + view.x,
+    y: pad + (1 - py) * usableH * view.scale + view.y,
     depth: 0,
     rScale: 1,
   };
 }
 
 function project3d(p, w, h) {
-  let x = (p.x3 ?? p.x) - 0.5;
-  let y = (p.y3 ?? p.y) - 0.5;
-  let z = (p.z3 ?? 0.5) - 0.5;
+  let x = semanticCoord("x", p, p.x3 ?? p.x) - 0.5;
+  let y = semanticCoord("y", p, p.y3 ?? p.y) - 0.5;
+  let z = semanticCoord("z", p, p.z3 ?? 0.5) - 0.5;
   const cy = Math.cos(cam3.yaw), sy = Math.sin(cam3.yaw);
   const cp = Math.cos(cam3.pitch), sp = Math.sin(cam3.pitch);
   let x1 = x * cy - z * sy;
@@ -1517,6 +1720,26 @@ function drawAxes3d(w, h) {
     ctx.lineWidth = 1;
     ctx.stroke();
   }
+}
+
+function drawAxisLabels2d(w, h) {
+  const xAxis = activeAxes.x;
+  const yAxis = activeAxes.y;
+  if (!xAxis && !yAxis) return;
+  ctx.save();
+  ctx.fillStyle = "rgba(242,235,227,0.72)";
+  ctx.font = '11px "JetBrains Mono"';
+  if (yAxis) {
+    ctx.fillText(`most ${yAxis.label}`, 18, 24);
+    ctx.fillText(`least ${yAxis.label}`, 18, h - 16);
+  }
+  if (xAxis) {
+    const right = `most ${xAxis.label}`;
+    const left = `least ${xAxis.label}`;
+    ctx.fillText(left, 18, h - 36);
+    ctx.fillText(right, Math.max(18, w - ctx.measureText(right).width - 18), h - 36);
+  }
+  ctx.restore();
 }
 
 function drawDiamond(x, y, r, fill, stroke) {
@@ -1628,6 +1851,7 @@ function draw() {
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
     }
     ctx.restore();
+    drawAxisLabels2d(w, h);
   } else {
     drawAxes3d(w, h);
   }
@@ -1743,6 +1967,7 @@ function renderPanel(p, kind = "point") {
   }
   const playing = playingId === p.id;
   const inQueue = playlist.some(track => track.id === p.id);
+  const tags = pointTags(p.id);
   const primaryLabel = playing && playbackMode === "queue" ? "Stop track" : "Play track";
   const previewLabel = playing && playbackMode === "preview" ? "Stop preview" : "Preview clip";
   const queueLabel = inQueue ? "Queued" : "Add to queue";
@@ -1761,7 +1986,14 @@ function renderPanel(p, kind = "point") {
           <button id="playPreview" class="ghost secondary ${playing && playbackMode === "preview" ? "playing" : ""}" ${p.playable ? "" : "disabled"}>${previewLabel}</button>
           <button id="queueTrack" class="ghost secondary" ${p.playable ? "" : "disabled"}>${queueLabel}</button>
         </div>
-        ${p.playable ? "" : '<div class="selection-status">File missing on disk</div>'}
+        <div class="tag-row">
+          ${tags.map(tag => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("") || '<span class="selection-status">No tags yet</span>'}
+        </div>
+        <div class="tag-input-row">
+          <input type="text" id="tagInput" placeholder="tag this item, comma separated" value="${escapeHtml(tags.join(", "))}" />
+          <button type="button" class="ghost secondary" id="saveTags">Save tags</button>
+        </div>
+        ${p.playable ? "" : `<div class="selection-status">${p.modality === "image" ? "Visual file on the map" : (p.modality === "text" ? "Text item on the map" : "File missing on disk")}</div>`}
         <canvas id="selectionWave" class="selection-mini-wave" width="360" height="36"></canvas>
       </div>
     </div>
@@ -1785,6 +2017,17 @@ function renderPanel(p, kind = "point") {
     queueBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       enqueueTracks([p]);
+    });
+  }
+  const saveTagsBtn = document.getElementById("saveTags");
+  const tagInputEl = document.getElementById("tagInput");
+  if (saveTagsBtn && tagInputEl) {
+    saveTagsBtn.addEventListener("click", () => saveTags(p.id, tagInputEl.value));
+    tagInputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        saveTags(p.id, tagInputEl.value);
+      }
     });
   }
   drawWavePlaceholder();
@@ -1890,6 +2133,162 @@ function updatePlaylistControls() {
   playlistMetaEl.textContent = `${playlist.length} track${playlist.length === 1 ? "" : "s"} queued`;
   queueNeighborsBtn.disabled = !hasSeed;
   updatePlayerChrome();
+}
+
+async function fetchJson(url, options = {}) {
+  const res = await fetch(url, {
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    ...options,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText || "Request failed");
+  return data;
+}
+
+function renderSavedPlaylists() {
+  savedPlaylistsEl.innerHTML = "";
+  const entries = Object.entries(libraryState.playlists || {});
+  if (!entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "playlist-meta";
+    empty.textContent = "No saved playlists yet";
+    savedPlaylistsEl.appendChild(empty);
+    return;
+  }
+  for (const [name, ids] of entries.sort((a, b) => a[0].localeCompare(b[0]))) {
+    const item = document.createElement("div");
+    item.className = "saved-item";
+    item.innerHTML = `
+      <div>
+        <div class="saved-name">${escapeHtml(name)}</div>
+        <div class="saved-count">${ids.length} track${ids.length === 1 ? "" : "s"}</div>
+      </div>
+      <button type="button" class="ghost">Load</button>
+      <button type="button" class="ghost danger">Delete</button>
+    `;
+    const [loadBtn, deleteBtn] = item.querySelectorAll("button");
+    loadBtn.addEventListener("click", () => {
+      const tracks = ids.map(id => byId.get(id)).filter(Boolean);
+      enqueueTracks(tracks, { replace: true, autoplay: false });
+      playlistMetaEl.textContent = `Loaded ${name}`;
+      playlistNameEl.value = name;
+    });
+    deleteBtn.addEventListener("click", async () => {
+      try {
+        libraryStatusEl.textContent = "Removing playlist…";
+        libraryState = await fetchJson("/api/library/playlist/delete", {
+          method: "POST",
+          body: JSON.stringify({ name }),
+        });
+        renderSavedPlaylists();
+        libraryStatusEl.textContent = `Deleted ${name}`;
+      } catch (err) {
+        libraryStatusEl.textContent = String(err.message || err);
+      }
+    });
+    savedPlaylistsEl.appendChild(item);
+  }
+}
+
+async function loadLibrary() {
+  try {
+    libraryState = await fetchJson("/api/library", { headers: {} });
+    renderSavedPlaylists();
+  } catch (err) {
+    libraryStatusEl.textContent = String(err.message || err);
+  }
+}
+
+async function saveCurrentPlaylist() {
+  if (!playlist.length) {
+    libraryStatusEl.textContent = "Queue a few tracks first";
+    return;
+  }
+  const name = playlistNameEl.value.trim();
+  if (!name) {
+    libraryStatusEl.textContent = "Name the playlist first";
+    return;
+  }
+  try {
+    libraryStatusEl.textContent = "Saving playlist…";
+    libraryState = await fetchJson("/api/library/playlist", {
+      method: "POST",
+      body: JSON.stringify({ name, ids: playlist.map(track => track.id) }),
+    });
+    renderSavedPlaylists();
+    libraryStatusEl.textContent = `Saved ${name}`;
+  } catch (err) {
+    libraryStatusEl.textContent = String(err.message || err);
+  }
+}
+
+function pointTags(pointId) {
+  return libraryState.tags?.[pointId] || [];
+}
+
+async function saveTags(pointId, rawValue) {
+  const tags = rawValue
+    .split(",")
+    .map(part => part.trim())
+    .filter(Boolean);
+  try {
+    libraryState = await fetchJson("/api/library/tags", {
+      method: "POST",
+      body: JSON.stringify({ id: pointId, tags }),
+    });
+    renderSavedPlaylists();
+    renderPanel(byId.get(pointId) || null);
+    libraryStatusEl.textContent = tags.length ? "Tags updated" : "Tags cleared";
+  } catch (err) {
+    libraryStatusEl.textContent = String(err.message || err);
+  }
+}
+
+async function applySemanticAxes() {
+  const requests = [
+    ["x", axisXEl.value.trim()],
+    ["y", axisYEl.value.trim()],
+    ["z", axisZEl.value.trim()],
+  ];
+  const nonEmpty = requests.filter(([, text]) => text);
+  if (!nonEmpty.length) {
+    activeAxes = { x: null, y: null, z: null };
+    renderAxesOverlay();
+    axesStatusEl.textContent = "Axes reset to the original map";
+    needsFrame = true;
+    return;
+  }
+  applyAxesBtn.disabled = true;
+  axesStatusEl.textContent = "Embedding axis phrases…";
+  try {
+    const nextAxes = { x: null, y: null, z: null };
+    for (const [key, text] of requests) {
+      if (!text) continue;
+      nextAxes[key] = await fetchJson("/api/axis", {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      });
+    }
+    activeAxes = nextAxes;
+    renderAxesOverlay();
+    axesStatusEl.textContent = "Semantic axes applied";
+    axesModalEl.hidden = true;
+    needsFrame = true;
+  } catch (err) {
+    axesStatusEl.textContent = String(err.message || err);
+  } finally {
+    applyAxesBtn.disabled = false;
+  }
+}
+
+function clearSemanticAxes() {
+  axisXEl.value = "";
+  axisYEl.value = "";
+  axisZEl.value = "";
+  activeAxes = { x: null, y: null, z: null };
+  renderAxesOverlay();
+  axesStatusEl.textContent = "Axes reset to the original map";
+  needsFrame = true;
 }
 
 function renderPlaylist() {
@@ -2124,6 +2523,8 @@ volumeIconBtn.addEventListener("click", () => {
   volumeBarEl.value = String(player.volume);
   updatePlayerChrome();
 });
+applyAxesBtn.addEventListener("click", applySemanticAxes);
+clearAxesBtn.addEventListener("click", clearSemanticAxes);
 
 function markInteract() {
   if (autoOrbit) {
@@ -2332,11 +2733,19 @@ async function queueNeighborsFromSelection() {
 }
 
 clearQueryBtn.addEventListener("click", clearQuery);
+savePlaylistBtn.addEventListener("click", saveCurrentPlaylist);
+playlistNameEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    saveCurrentPlaylist();
+  }
+});
 queueVisibleBtn.addEventListener("click", () => {
   enqueueTracks(visiblePoints(), { replace: true, autoplay: true });
 });
 queueNeighborsBtn.addEventListener("click", () => {
   setQueueDrawer(true);
+  closeTransientPanels({ keep: "neighbors" });
   setNeighborsPopover(neighborsPopoverEl.hidden);
 });
 neighborsGoBtn.addEventListener("click", queueNeighborsFromSelection);
@@ -2352,6 +2761,7 @@ queueToggleBtn.addEventListener("click", () => {
 });
 closeQueueBtn.addEventListener("click", () => {
   setQueueDrawer(false);
+  setNeighborsPopover(false);
 });
 clearPlaylistBtn.addEventListener("click", () => {
   playlist = [];
@@ -2445,6 +2855,10 @@ function loop() {
 
 window.addEventListener("resize", resize);
 window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !axesModalEl.hidden) {
+    axesModalEl.hidden = true;
+    return;
+  }
   if (e.key === "Escape" && !infoModalEl.hidden) {
     infoModalEl.hidden = true;
     return;
@@ -2481,6 +2895,8 @@ window.addEventListener("keydown", (e) => {
 
 updateStats();
 renderPlaylist();
+renderAxesOverlay();
+loadLibrary();
 resize();
 draw();
 requestAnimationFrame(loop);
@@ -2637,7 +3053,7 @@ def _send_audio_file(handler: BaseHTTPRequestHandler, path: str) -> None:
             remaining -= len(chunk)
 
 
-def make_handler(index: MapIndex, html: str):
+def make_handler(index: MapIndex, html: str, library: LibraryState):
     by_id = index._by_id
 
     class Handler(BaseHTTPRequestHandler):
@@ -2692,6 +3108,10 @@ def make_handler(index: MapIndex, html: str):
                     self._send_json({"error": "Unknown id"}, 404)
                     return
                 self._send_json({"neighbors": neighbors})
+                return
+
+            if parsed.path == "/api/library":
+                self._send_json(library.snapshot())
                 return
 
             if parsed.path == "/preview":
@@ -2749,6 +3169,76 @@ def make_handler(index: MapIndex, html: str):
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            if parsed.path == "/api/axis":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "Invalid JSON"}, 400)
+                    return
+                try:
+                    phrase = str(payload.get("text") or "")
+                    self._send_json(index.semantic_axis(phrase))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if parsed.path == "/api/library/playlist":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "Invalid JSON"}, 400)
+                    return
+                try:
+                    snapshot = library.save_playlist(
+                        str(payload.get("name") or ""),
+                        list(payload.get("ids") or []),
+                    )
+                    self._send_json(snapshot)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if parsed.path == "/api/library/playlist/delete":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "Invalid JSON"}, 400)
+                    return
+                try:
+                    snapshot = library.delete_playlist(str(payload.get("name") or ""))
+                    self._send_json(snapshot)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if parsed.path == "/api/library/tags":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "Invalid JSON"}, 400)
+                    return
+                try:
+                    snapshot = library.set_tags(
+                        str(payload.get("id") or ""),
+                        list(payload.get("tags") or []),
+                    )
+                    self._send_json(snapshot)
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
             if parsed.path != "/api/query":
                 self.send_error(404, "Not found")
                 return
@@ -2823,13 +3313,14 @@ def run_server(
     preload_model: bool = False,
 ) -> None:
     index = MapIndex(db_path, collection)
+    library = LibraryState(str(Path(db_path) / ".anyembed_library.json"))
     if preload_model:
         index.get_embedder()
     html = (
         HTML_PAGE.replace("__POINTS_JSON__", json.dumps(index.points))
         .replace("__PREVIEW_SECONDS__", str(PREVIEW_SECONDS))
     )
-    handler = make_handler(index, html)
+    handler = make_handler(index, html, library)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     url = f"http://127.0.0.1:{port}/"
     print(f"map ready → {url}", flush=True)
