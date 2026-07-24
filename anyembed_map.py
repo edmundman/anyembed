@@ -14,6 +14,7 @@ import argparse
 import json
 import mimetypes
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -25,12 +26,23 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
+from anyembed import (
+    AnyEmbedDB,
+    current_embedder_settings,
+    default_collection_name,
+    detect_modality,
+    get_provider_mode,
+)
+
+os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(tempfile.gettempdir(), "anyembed_numba_cache"))
+
 DEFAULT_DB_PATH = "./anyembed_db"
 DEFAULT_COLLECTION = "anyembed"
 DEFAULT_PORT = 8765
 PREVIEW_SECONDS = 16
 PREVIEW_START_FRAC = 0.28
 DEFAULT_NEIGHBORS = 8
+LEGACY_LOCAL_COLLECTION = DEFAULT_COLLECTION
 
 UPLOAD_EXTS = {
     ".jpg",
@@ -74,10 +86,25 @@ def _l2_normalize(mat):
     return mat / np.clip(norms, 1e-12, None)
 
 
+def _update_env_file(path: Path, updates: dict[str, str]) -> None:
+    existing: dict[str, str] = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "=" not in line or line.lstrip().startswith("#"):
+                continue
+            key, value = line.split("=", 1)
+            existing[key.strip()] = value
+    existing.update(updates)
+    lines = [f"{key}={value}" for key, value in sorted(existing.items())]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for key, value in updates.items():
+        os.environ[key] = value
+
+
 class MapIndex:
     """Embeddings + fitted PCA/UMAP projectors for placing new queries."""
 
-    def __init__(self, db_path: str, collection: str):
+    def __init__(self, db_path: str, collection: str, embedder=None, embedder_factory=None):
         import numpy as np
         import chromadb
         from sklearn.decomposition import PCA
@@ -86,40 +113,60 @@ class MapIndex:
         client = chromadb.PersistentClient(path=db_path)
         col = client.get_or_create_collection(collection)
         n = col.count()
-        if n == 0:
-            raise SystemExit(f"No records in {db_path!r} / collection {collection!r}")
-
         print(f"loading {n} embeddings from {db_path} …", flush=True)
         result = col.get(include=["metadatas", "documents", "embeddings"])
         ids = result["ids"]
         metadatas = result["metadatas"] or [{}] * len(ids)
         documents = result["documents"] or [""] * len(ids)
-        embeddings = _l2_normalize(np.asarray(result["embeddings"], dtype=np.float32))
+        raw_embeddings = result.get("embeddings")
+        if raw_embeddings is None:
+            raw_embeddings = []
+        self._embedder = embedder
+        self._embedder_factory = embedder_factory
+        self._embedder_lock = threading.Lock()
+        if len(raw_embeddings):
+            embeddings = _l2_normalize(np.asarray(raw_embeddings, dtype=np.float32))
+            self.embeddings = embeddings
+        else:
+            self.embeddings = np.zeros((0, 0), dtype=np.float32)
 
-        print("projecting (PCA → UMAP 2D + 3D) …", flush=True)
-        n_pca = min(50, embeddings.shape[0] - 1, embeddings.shape[1])
-        self.pca = PCA(n_components=n_pca, random_state=42)
-        reduced = self.pca.fit_transform(embeddings)
-        n_neighbors = min(15, max(2, embeddings.shape[0] - 1))
-        shared = dict(
-            n_neighbors=n_neighbors,
-            min_dist=0.12,
-            metric="euclidean",
-            random_state=42,
-        )
-        self.umap2 = UMAP(n_components=2, **shared)
-        self.umap3 = UMAP(n_components=3, **shared)
-        coords2_raw = self.umap2.fit_transform(reduced)
-        coords3_raw = self.umap3.fit_transform(reduced)
+        if n >= 2:
+            print("projecting (PCA → UMAP 2D + 3D) …", flush=True)
+            n_pca = min(50, self.embeddings.shape[0] - 1, self.embeddings.shape[1])
+            self.pca = PCA(n_components=n_pca, random_state=42)
+            reduced = self.pca.fit_transform(self.embeddings)
+            n_neighbors = min(15, max(2, self.embeddings.shape[0] - 1))
+            shared = dict(
+                n_neighbors=n_neighbors,
+                min_dist=0.12,
+                metric="euclidean",
+                random_state=42,
+            )
+            self.umap2 = UMAP(n_components=2, **shared)
+            self.umap3 = UMAP(n_components=3, **shared)
+            coords2_raw = self.umap2.fit_transform(reduced)
+            coords3_raw = self.umap3.fit_transform(reduced)
+            self.mins2 = coords2_raw.min(axis=0)
+            self.spans2 = np.clip(coords2_raw.max(axis=0) - self.mins2, 1e-9, None)
+            self.mins3 = coords3_raw.min(axis=0)
+            self.spans3 = np.clip(coords3_raw.max(axis=0) - self.mins3, 1e-9, None)
+            coords2 = (coords2_raw - self.mins2) / self.spans2
+            coords3 = (coords3_raw - self.mins3) / self.spans3
+        else:
+            self.pca = None
+            self.umap2 = None
+            self.umap3 = None
+            self.mins2 = np.zeros(2, dtype=np.float32)
+            self.spans2 = np.ones(2, dtype=np.float32)
+            self.mins3 = np.zeros(3, dtype=np.float32)
+            self.spans3 = np.ones(3, dtype=np.float32)
+            if n == 1:
+                coords2 = np.asarray([[0.5, 0.5]], dtype=np.float32)
+                coords3 = np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32)
+            else:
+                coords2 = np.zeros((0, 2), dtype=np.float32)
+                coords3 = np.zeros((0, 3), dtype=np.float32)
 
-        self.mins2 = coords2_raw.min(axis=0)
-        self.spans2 = np.clip(coords2_raw.max(axis=0) - self.mins2, 1e-9, None)
-        self.mins3 = coords3_raw.min(axis=0)
-        self.spans3 = np.clip(coords3_raw.max(axis=0) - self.mins3, 1e-9, None)
-        coords2 = (coords2_raw - self.mins2) / self.spans2
-        coords3 = (coords3_raw - self.mins3) / self.spans3
-
-        self.embeddings = embeddings
         self.points: list[dict[str, Any]] = []
         for i, id_ in enumerate(ids):
             meta = metadatas[i] or {}
@@ -144,12 +191,12 @@ class MapIndex:
 
         self._by_id = {p["id"]: p for p in self.points}
         self._index_by_id = {p["id"]: i for i, p in enumerate(self.points)}
-        self._embedder = None
-        self._embedder_lock = threading.Lock()
 
     def project_embedding(self, embedding) -> dict[str, float]:
         import numpy as np
 
+        if self.pca is None or self.umap2 is None or self.umap3 is None:
+            return {"x": 0.5, "y": 0.5, "x3": 0.5, "y3": 0.5, "z3": 0.5}
         vec = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
         vec = _l2_normalize(vec)
         reduced = self.pca.transform(vec)
@@ -165,6 +212,8 @@ class MapIndex:
     def nearest(self, embedding, top_k: int = DEFAULT_NEIGHBORS) -> list[dict[str, Any]]:
         import numpy as np
 
+        if not len(self.points):
+            return []
         vec = _l2_normalize(np.asarray(embedding, dtype=np.float32).reshape(1, -1))[0]
         sims = self.embeddings @ vec
         k = min(top_k, len(self.points))
@@ -251,11 +300,15 @@ class MapIndex:
     def get_embedder(self):
         with self._embedder_lock:
             if self._embedder is None:
-                print("loading embedding model (first query) …", flush=True)
-                from anyembed import E5OmniEmbedder
-
-                self._embedder = E5OmniEmbedder()
-                print("embedding model ready", flush=True)
+                print("loading embedding backend (first query) …", flush=True)
+                if self._embedder_factory is not None:
+                    self._embedder = self._embedder_factory()
+                else:
+                    self._embedder = AnyEmbedDB(
+                        path=DEFAULT_DB_PATH,
+                        collection=default_collection_name(),
+                    ).embedder
+                print("embedding backend ready", flush=True)
             return self._embedder
 
     def query_item(
@@ -265,8 +318,6 @@ class MapIndex:
         modality: Optional[str] = None,
         top_k: int = DEFAULT_NEIGHBORS,
     ) -> dict[str, Any]:
-        from anyembed import detect_modality
-
         embedder = self.get_embedder()
         modality = modality or detect_modality(item)
         embedding = embedder.embed(item, modality=modality)
@@ -283,12 +334,14 @@ class MapIndex:
         }
 
 
-def _parse_multipart(content_type: str, body: bytes) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+def _parse_multipart(
+    content_type: str, body: bytes
+) -> tuple[dict[str, str], dict[str, list[tuple[str, bytes]]]]:
     """Return (fields, files) from a multipart/form-data body."""
     headers = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n"
     msg = message_from_bytes(headers.encode("utf-8") + body, policy=email_policy)
     fields: dict[str, str] = {}
-    files: dict[str, tuple[str, bytes]] = {}
+    files: dict[str, list[tuple[str, bytes]]] = {}
     for part in msg.iter_parts():
         disp = part.get("Content-Disposition", "")
         if "form-data" not in disp:
@@ -299,7 +352,7 @@ def _parse_multipart(content_type: str, body: bytes) -> tuple[dict[str, str], di
         filename = part.get_filename()
         payload = part.get_payload(decode=True) or b""
         if filename:
-            files[name] = (filename, payload)
+            files.setdefault(name, []).append((filename, payload))
         else:
             fields[name] = payload.decode("utf-8", errors="replace")
     return fields, files
@@ -382,6 +435,137 @@ class LibraryState:
             self._data["tags"][point_id] = clean
             self._save()
             return self.snapshot()
+
+
+class MapAppState:
+    def __init__(self, db_path: str, collection: str):
+        self.db_path = db_path
+        self.collection_override = None if collection == DEFAULT_COLLECTION else collection
+        self.env_path = Path(__file__).with_name(".env")
+        self.library = LibraryState(str(Path(db_path) / ".anyembed_library.json"))
+        self._lock = threading.RLock()
+        self._db: Optional[AnyEmbedDB] = None
+        self._index: Optional[MapIndex] = None
+        self.reload()
+
+    def _collection_names(self) -> set[str]:
+        import chromadb
+
+        client = chromadb.PersistentClient(path=self.db_path)
+        names: set[str] = set()
+        for entry in client.list_collections():
+            names.add(getattr(entry, "name", str(entry)))
+        return names
+
+    def current_settings(self) -> dict[str, Any]:
+        settings = current_embedder_settings()
+        settings["collection"] = self.collection_name(settings["mode"])
+        settings["api_key_configured"] = bool(settings["vertex_api_key"])
+        settings["point_count"] = len(self.index().points)
+        return settings
+
+    def collection_name(self, mode: Optional[str] = None) -> str:
+        resolved = get_provider_mode(mode)
+        if self.collection_override:
+            return self.collection_override
+        preferred = default_collection_name(resolved)
+        if resolved != "local":
+            return preferred
+        names = self._collection_names()
+        if preferred in names:
+            return preferred
+        if LEGACY_LOCAL_COLLECTION in names:
+            return LEGACY_LOCAL_COLLECTION
+        return preferred
+
+    def db(self) -> AnyEmbedDB:
+        with self._lock:
+            assert self._db is not None
+            return self._db
+
+    def index(self) -> MapIndex:
+        with self._lock:
+            assert self._index is not None
+            return self._index
+
+    def reload(self) -> None:
+        with self._lock:
+            mode = get_provider_mode()
+            self._db = AnyEmbedDB(
+                path=self.db_path,
+                collection=self.collection_name(mode),
+                provider_mode=mode,
+            )
+            self._index = MapIndex(
+                self.db_path,
+                self.collection_name(mode),
+                embedder_factory=lambda: self.db().embedder,
+            )
+
+    def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        updates = {
+            "ANYEMBED_EMBEDDER_MODE": get_provider_mode(str(payload.get("mode") or "")),
+            "ANYEMBED_LOCAL_MODEL": str(payload.get("local_model") or "").strip() or "Haon-Chen/e5-omni-7B",
+            "GOOGLE_CLOUD_PROJECT": str(payload.get("vertex_project") or "").strip(),
+            "GOOGLE_CLOUD_LOCATION": str(payload.get("vertex_location") or DEFAULT_VERTEX_LOCATION).strip(),
+            "ANYEMBED_VERTEX_MODEL": str(payload.get("vertex_model") or "").strip() or "gemini-embedding-2",
+        }
+        _update_env_file(self.env_path, updates)
+        self.reload()
+        return self.current_settings()
+
+    def ingest_uploaded_folder(self, files: list[tuple[str, bytes]]) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="anyembed_ingest_") as tmpdir:
+            for name, payload in files:
+                safe_name = Path(name)
+                dest = Path(tmpdir, *safe_name.parts)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(payload)
+            results = self.db().add_folder(tmpdir, progress=False, skip_existing=False)
+        self.reload()
+        return {"imported": len(results), "point_count": len(self.index().points)}
+
+    def import_embedding_upload(self, upload_name: str, payload: bytes) -> dict[str, Any]:
+        suffix = Path(upload_name).suffix or ".json"
+        fd, tmp_path = tempfile.mkstemp(prefix="anyembed_vectors_", suffix=suffix)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+            count = self.db().import_embeddings_file(tmp_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        self.reload()
+        return {"imported": count, "point_count": len(self.index().points)}
+
+
+def _read_request_body(handler: BaseHTTPRequestHandler) -> bytes:
+    raw_length = handler.headers.get("Content-Length", "0") or "0"
+    try:
+        length = max(0, int(raw_length))
+    except ValueError as exc:
+        raise ValueError("Invalid Content-Length") from exc
+    if length == 0:
+        return b""
+    chunks = []
+    remaining = length
+    while remaining > 0:
+        try:
+            chunk = handler.rfile.read(min(1024 * 1024, remaining))
+        except OSError as exc:
+            raise OSError(f"Could not read request body: {exc}") from exc
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    body = b"".join(chunks)
+    if len(body) != length:
+        raise OSError(
+            f"Request body truncated ({len(body)} of {length} bytes received)"
+        )
+    return body
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -1090,7 +1274,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     gap: 0.45rem;
     flex-wrap: wrap;
   }
-  .tag-input-row input, .playlist-save-row input {
+  .tag-input-row input, .playlist-save-row input, .playlist-save-row select {
     flex: 1 1 180px;
     min-width: 0;
     background: var(--bg);
@@ -1101,7 +1285,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font: 500 0.8rem "Instrument Sans", sans-serif;
     outline: none;
   }
-  .tag-input-row input:focus, .playlist-save-row input:focus {
+  .tag-input-row input:focus, .playlist-save-row input:focus, .playlist-save-row select:focus {
     border-color: var(--accent-dim);
   }
   .playlist-save-row {
@@ -1160,6 +1344,60 @@ HTML_PAGE = r"""<!DOCTYPE html>
     box-shadow: 0 18px 40px rgba(0,0,0,0.34);
   }
   .info-modal[hidden] { display: none; }
+  .settings-modal {
+    position: fixed;
+    right: 1rem;
+    top: 4.2rem;
+    width: min(420px, calc(100vw - 2rem));
+    z-index: 6;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 1rem;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.16)),
+      var(--bg-elev);
+    box-shadow: 0 18px 40px rgba(0,0,0,0.34);
+  }
+  .settings-modal[hidden] { display: none; }
+  .settings-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.6rem;
+    align-items: center;
+    margin-top: 0.7rem;
+  }
+  .settings-grid .label {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.66rem;
+    color: var(--muted);
+  }
+  .settings-grid input,
+  .settings-grid select {
+    width: 100%;
+    min-width: 0;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 10px;
+    padding: 0.5rem 0.65rem;
+    font: 500 0.8rem "Instrument Sans", sans-serif;
+    outline: none;
+  }
+  .settings-grid input:focus,
+  .settings-grid select:focus {
+    border-color: var(--accent-dim);
+  }
+  .settings-actions {
+    display: flex;
+    gap: 0.45rem;
+    margin-top: 0.8rem;
+    flex-wrap: wrap;
+  }
+  .settings-subtle {
+    color: var(--muted);
+    font: 0.66rem "JetBrains Mono", monospace;
+    margin-top: 0.55rem;
+  }
   .axes-modal {
     position: fixed;
     left: 1rem;
@@ -1236,6 +1474,58 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--ink);
     font-weight: 600;
   }
+  .embed-busy {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 4;
+    min-width: min(360px, calc(100vw - 4rem));
+    padding: 1rem 1.1rem;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+    border-radius: 18px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.18)),
+      rgba(18,16,14,0.92);
+    box-shadow: 0 18px 42px rgba(0,0,0,0.36);
+    pointer-events: none;
+  }
+  .embed-busy[hidden] { display: none; }
+  .embed-busy-title {
+    font: 700 0.86rem "Instrument Sans", sans-serif;
+    letter-spacing: -0.01em;
+  }
+  .embed-busy-copy {
+    margin-top: 0.28rem;
+    color: var(--muted);
+    font: 0.72rem "JetBrains Mono", monospace;
+    line-height: 1.5;
+  }
+  .embed-busy-bars {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 0.35rem;
+    margin-top: 0.8rem;
+    align-items: end;
+    height: 26px;
+  }
+  .embed-busy-bars span {
+    display: block;
+    width: 100%;
+    border-radius: 999px;
+    background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 55%, #ffffff 18%));
+    animation: embed-bars 0.9s ease-in-out infinite;
+    transform-origin: bottom center;
+  }
+  .embed-busy-bars span:nth-child(1) { animation-delay: 0s; height: 35%; }
+  .embed-busy-bars span:nth-child(2) { animation-delay: 0.1s; height: 65%; }
+  .embed-busy-bars span:nth-child(3) { animation-delay: 0.2s; height: 100%; }
+  .embed-busy-bars span:nth-child(4) { animation-delay: 0.3s; height: 72%; }
+  .embed-busy-bars span:nth-child(5) { animation-delay: 0.4s; height: 44%; }
+  @keyframes embed-bars {
+    0%, 100% { transform: scaleY(0.45); opacity: 0.55; }
+    50% { transform: scaleY(1); opacity: 1; }
+  }
   .info-grid {
     display: grid;
     grid-template-columns: auto 1fr;
@@ -1289,6 +1579,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
       <label class="tog spin-tog" id="spinLabel"><input type="checkbox" id="spin" /> spin</label>
       <label class="tog"><input type="checkbox" id="audioOnly" checked /> audio only</label>
+      <button type="button" class="toolbar-btn" id="settingsToggle">Settings</button>
       <button type="button" class="toolbar-btn" id="axesToggle">Axes</button>
       <button type="button" class="toolbar-btn icon-btn" id="infoToggle" aria-label="Info">i</button>
       <button type="button" class="toolbar-btn" id="resetView">Reset view</button>
@@ -1299,6 +1590,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <canvas id="stage"></canvas>
     <div id="hint">scroll zoom · drag pan · click play · hover for info</div>
     <div class="axes-overlay" id="axesOverlay"></div>
+    <div class="embed-busy" id="embedBusy" hidden>
+      <div class="embed-busy-title" id="embedBusyTitle">Embedding…</div>
+      <div class="embed-busy-copy" id="embedBusyCopy">Preparing your media for the map.</div>
+      <div class="embed-busy-bars" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+    </div>
   </div>
   <aside id="panel">
     <div class="eyebrow">selection</div>
@@ -1325,10 +1623,51 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <div class="section">
+      <div class="eyebrow">ingest</div>
+      <div class="file-row">
+        <input type="file" id="folderUpload" webkitdirectory directory multiple />
+      </div>
+      <div class="playlist-meta" id="pricingHint">Estimate uses Google&apos;s current Gemini Embedding 2 pricing before upload.</div>
+      <div class="play-row">
+        <button type="button" class="action" id="embedFolderBtn">Embed folder</button>
+      </div>
+      <div class="file-row" style="margin-top:0.55rem">
+        <input type="file" id="embeddingImportFile" accept=".json,.jsonl" />
+      </div>
+      <div class="play-row">
+        <button type="button" class="ghost" id="importEmbeddingsBtn">Import vectors</button>
+      </div>
+      <div class="status-line" id="ingestStatus"></div>
+    </div>
+
+    <div class="section">
       <div class="eyebrow">library</div>
       <div class="playlist-meta" id="libraryStatus">Saved playlists and tags stay local to this DB.</div>
     </div>
   </aside>
+</div>
+<div class="settings-modal" id="settingsModal" hidden>
+  <div class="eyebrow">embedding settings</div>
+  <div class="settings-grid">
+    <span class="label">mode</span>
+    <select id="embedMode">
+      <option value="vertex">Vertex AI</option>
+      <option value="local">Local</option>
+    </select>
+    <span class="label" id="localModelLabel">local model</span>
+    <select id="localModel"></select>
+    <span class="label" id="vertexProjectLabel">project</span>
+    <input type="text" id="vertexProject" placeholder="Google Cloud project" />
+    <span class="label" id="vertexLocationLabel">location</span>
+    <input type="text" id="vertexLocation" placeholder="Location" value="global" />
+    <span class="label" id="vertexModelLabel">vertex model</span>
+    <input type="text" id="vertexModel" placeholder="Model" value="gemini-embedding-2" />
+  </div>
+  <div class="settings-actions">
+    <button type="button" class="action" id="saveSettings">Apply</button>
+    <button type="button" class="ghost" id="closeSettings">Close</button>
+  </div>
+  <div class="settings-subtle" id="settingsStatus"></div>
 </div>
 <div class="axes-modal" id="axesModal" hidden>
   <div class="eyebrow">semantic axes</div>
@@ -1470,6 +1809,9 @@ const spinLabel = document.getElementById("spinLabel");
 const hintEl = document.getElementById("hint");
 const mode2dBtn = document.getElementById("mode2d");
 const mode3dBtn = document.getElementById("mode3d");
+const settingsToggleBtn = document.getElementById("settingsToggle");
+const settingsModalEl = document.getElementById("settingsModal");
+const closeSettingsBtn = document.getElementById("closeSettings");
 const axesToggleBtn = document.getElementById("axesToggle");
 const axesModalEl = document.getElementById("axesModal");
 const axesOverlayEl = document.getElementById("axesOverlay");
@@ -1488,6 +1830,25 @@ const queryBtn = document.getElementById("queryBtn");
 const clearQueryBtn = document.getElementById("clearQuery");
 const queryStatus = document.getElementById("queryStatus");
 const fileLabel = document.getElementById("fileLabel");
+const embedModeEl = document.getElementById("embedMode");
+const localModelEl = document.getElementById("localModel");
+const localModelLabelEl = document.getElementById("localModelLabel");
+const vertexProjectEl = document.getElementById("vertexProject");
+const vertexProjectLabelEl = document.getElementById("vertexProjectLabel");
+const vertexLocationEl = document.getElementById("vertexLocation");
+const vertexLocationLabelEl = document.getElementById("vertexLocationLabel");
+const vertexModelEl = document.getElementById("vertexModel");
+const vertexModelLabelEl = document.getElementById("vertexModelLabel");
+const saveSettingsBtn = document.getElementById("saveSettings");
+const settingsStatusEl = document.getElementById("settingsStatus");
+const folderUploadEl = document.getElementById("folderUpload");
+const embedFolderBtn = document.getElementById("embedFolderBtn");
+const embeddingImportFileEl = document.getElementById("embeddingImportFile");
+const importEmbeddingsBtn = document.getElementById("importEmbeddingsBtn");
+const ingestStatusEl = document.getElementById("ingestStatus");
+const embedBusyEl = document.getElementById("embedBusy");
+const embedBusyTitleEl = document.getElementById("embedBusyTitle");
+const embedBusyCopyEl = document.getElementById("embedBusyCopy");
 const neighborBlock = document.getElementById("neighborBlock");
 const neighborsEl = document.getElementById("neighbors");
 const queueDrawerEl = document.getElementById("queueDrawer");
@@ -1535,6 +1896,7 @@ let anim = 1;
 let projected = [];
 let needsFrame = true;
 let queryPoint = null; // {title, modality, x,y,x3,y3,z3}
+let queryPoints = [];
 let neighborIds = new Set();
 let queryBusy = false;
 let playlist = [];
@@ -1550,9 +1912,34 @@ let repeatMode = false;
 let queueDrawerOpen = false;
 let activeAxes = { x: null, y: null, z: null };
 let libraryState = { playlists: {}, tags: {} };
+let folderCostEstimate = null;
+let folderEstimateBusy = false;
+
+const EMBEDDING_PRICING = {
+  sourceDate: "2026-07-24",
+  sourceLabel: "Google Gemini Enterprise Agent Platform pricing",
+  textPerMillionTokens: 0.2,
+  imageEach: 0.00012,
+  audioPerSecond: 0.00016,
+  videoPerFrame: 0.00079,
+  defaultVideoFps: 1,
+  maxVideoSeconds: 120,
+  maxAudioSeconds: 180,
+  estimatedCharsPerToken: 4,
+};
 
 function currentSeedId() {
   return selectedId || playingId || (currentTrack() && currentTrack().id) || null;
+}
+
+function currentQueryPoint() {
+  return queryPoint || (queryPoints.length ? queryPoints[queryPoints.length - 1] : null);
+}
+
+function setEmbedBusy(active, title = "Embedding…", copy = "Preparing your media for the map.") {
+  embedBusyEl.hidden = !active;
+  embedBusyTitleEl.textContent = title;
+  embedBusyCopyEl.textContent = copy;
 }
 
 function setNeighborsPopover(open) {
@@ -1595,9 +1982,22 @@ function renderAxesOverlay() {
 }
 
 function closeTransientPanels({ keep = null } = {}) {
+  if (keep !== "settings") settingsModalEl.hidden = true;
   if (keep !== "axes") axesModalEl.hidden = true;
   if (keep !== "info") infoModalEl.hidden = true;
   if (keep !== "neighbors") setNeighborsPopover(false);
+}
+
+function syncModeFields() {
+  const remote = embedModeEl.value === "vertex";
+  localModelEl.hidden = remote;
+  localModelLabelEl.hidden = remote;
+  vertexProjectEl.hidden = !remote;
+  vertexProjectLabelEl.hidden = !remote;
+  vertexLocationEl.hidden = !remote;
+  vertexLocationLabelEl.hidden = !remote;
+  vertexModelEl.hidden = !remote;
+  vertexModelLabelEl.hidden = !remote;
 }
 
 function visiblePoints() {
@@ -1634,6 +2034,14 @@ function resetView() {
 
 mode2dBtn.addEventListener("click", () => setMode("2d"));
 mode3dBtn.addEventListener("click", () => setMode("3d"));
+settingsToggleBtn.addEventListener("click", () => {
+  const nextOpen = settingsModalEl.hidden;
+  closeTransientPanels({ keep: nextOpen ? "settings" : null });
+  settingsModalEl.hidden = !nextOpen;
+});
+closeSettingsBtn.addEventListener("click", () => {
+  settingsModalEl.hidden = true;
+});
 axesToggleBtn.addEventListener("click", () => {
   const nextOpen = axesModalEl.hidden;
   closeTransientPanels({ keep: nextOpen ? "axes" : null });
@@ -1838,6 +2246,7 @@ function draw() {
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
   const pad = 48;
+  const activeQuery = currentQueryPoint();
   ctx.clearRect(0, 0, w, h);
 
   if (mode === "2d") {
@@ -1864,8 +2273,8 @@ function draw() {
   if (mode === "3d") projected.sort((a, b) => b.depth - a.depth);
 
   // Lines from query to neighbors
-  if (queryPoint) {
-    const qs = projectPoint(queryPoint, w, h, pad);
+  if (activeQuery) {
+    const qs = projectPoint(activeQuery, w, h, pad);
     for (const s of projected) {
       if (!neighborIds.has(s.p.id)) continue;
       ctx.beginPath();
@@ -1908,10 +2317,19 @@ function draw() {
     ctx.globalAlpha = 1;
   }
 
-  if (queryPoint) {
-    const qs = projectPoint(queryPoint, w, h, pad);
-    const pulse = 1 + (playingId ? 0 : Math.sin(performance.now() / 220) * 0.08);
-    drawDiamond(qs.x, qs.y, 8 * pulse * ease, colors.query, "rgba(232,165,75,0.9)");
+  for (const qp of queryPoints) {
+    const qs = projectPoint(qp, w, h, pad);
+    const isActiveQuery = activeQuery && qp.id === activeQuery.id;
+    const pulse = isActiveQuery ? 1 + (playingId ? 0 : Math.sin(performance.now() / 220) * 0.08) : 1;
+    ctx.globalAlpha = isActiveQuery ? 1 : 0.55;
+    drawDiamond(
+      qs.x,
+      qs.y,
+      (isActiveQuery ? 8 : 6) * pulse * ease,
+      colors.query,
+      isActiveQuery ? "rgba(232,165,75,0.9)" : "rgba(242,235,227,0.5)"
+    );
+    ctx.globalAlpha = 1;
   }
 
   if (lassoMode || lassoPoints.length) {
@@ -1923,10 +2341,11 @@ function draw() {
 
 function hitTest(mx, my) {
   // Query diamond first
-  if (queryPoint) {
+  for (let i = queryPoints.length - 1; i >= 0; i -= 1) {
     const w = canvas.clientWidth, h = canvas.clientHeight, pad = 48;
-    const qs = projectPoint(queryPoint, w, h, pad);
-    if (Math.hypot(qs.x - mx, qs.y - my) < 14) return { kind: "query", point: queryPoint };
+    const qp = queryPoints[i];
+    const qs = projectPoint(qp, w, h, pad);
+    if (Math.hypot(qs.x - mx, qs.y - my) < 14) return { kind: "query", point: qp };
   }
   let best = null;
   let bestD = 18;
@@ -2143,6 +2562,260 @@ async function fetchJson(url, options = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || res.statusText || "Request failed");
   return data;
+}
+
+function syncSettingsUi(settings) {
+  embedModeEl.value = settings.mode || "vertex";
+  localModelEl.innerHTML = "";
+  for (const model of settings.local_models || []) {
+    const option = document.createElement("option");
+    option.value = model;
+    option.textContent = model;
+    if (model === settings.local_model) option.selected = true;
+    localModelEl.appendChild(option);
+  }
+  vertexProjectEl.value = settings.vertex_project || "";
+  vertexLocationEl.value = settings.vertex_location || "global";
+  vertexModelEl.value = settings.vertex_model || "gemini-embedding-2";
+  syncModeFields();
+  settingsStatusEl.textContent = embedModeEl.value === "vertex"
+    ? `${settings.api_key_configured ? "API key loaded" : "API key missing"} · collection ${settings.collection || ""}`
+    : `Local model ready · collection ${settings.collection || ""}`;
+}
+
+function formatUsd(value) {
+  if (!Number.isFinite(value)) return "$0.00";
+  if (value < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
+}
+
+function estimateFileModality(file) {
+  const name = (file.webkitRelativePath || file.name || "").toLowerCase();
+  if (/\.(txt|md)$/i.test(name)) return "text";
+  if (/\.(jpg|jpeg|png|gif|bmp|webp|tif|tiff)$/i.test(name)) return "image";
+  if (/\.(wav|mp3|flac|ogg|m4a|aac|opus|wma)$/i.test(name)) return "audio";
+  if (/\.(mp4|mov|avi|mkv|webm|mpeg|mpg|m4v)$/i.test(name)) return "video";
+  return "skip";
+}
+
+function loadMediaDuration(file, tagName) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement(tagName);
+    const url = URL.createObjectURL(file);
+    const cleanup = () => URL.revokeObjectURL(url);
+    el.preload = "metadata";
+    el.onloadedmetadata = () => {
+      const duration = Number(el.duration);
+      cleanup();
+      if (Number.isFinite(duration) && duration > 0) resolve(duration);
+      else reject(new Error("Missing duration metadata"));
+    };
+    el.onerror = () => {
+      cleanup();
+      reject(new Error("Could not read media metadata"));
+    };
+    el.src = url;
+  });
+}
+
+async function estimateFolderCost() {
+  const files = Array.from(folderUploadEl.files || []);
+  folderCostEstimate = null;
+  if (!files.length) {
+    ingestStatusEl.textContent = "Choose a folder first";
+    return null;
+  }
+  folderEstimateBusy = true;
+  embedFolderBtn.disabled = true;
+  ingestStatusEl.textContent = `Scanning ${files.length} file${files.length === 1 ? "" : "s"} for a cost estimate…`;
+  const totals = {
+    files: files.length,
+    textFiles: 0,
+    imageFiles: 0,
+    audioFiles: 0,
+    videoFiles: 0,
+    skippedFiles: 0,
+    estimatedTextTokens: 0,
+    estimatedAudioSeconds: 0,
+    estimatedVideoFrames: 0,
+    estimatedCost: 0,
+    warnings: [],
+  };
+
+  for (const file of files) {
+    const modality = estimateFileModality(file);
+    if (modality === "skip") {
+      totals.skippedFiles += 1;
+      continue;
+    }
+    if (modality === "text") {
+      totals.textFiles += 1;
+      const estimatedTokens = Math.max(
+        1,
+        Math.ceil(file.size / EMBEDDING_PRICING.estimatedCharsPerToken)
+      );
+      totals.estimatedTextTokens += estimatedTokens;
+      totals.estimatedCost += (estimatedTokens / 1_000_000) * EMBEDDING_PRICING.textPerMillionTokens;
+      continue;
+    }
+    if (modality === "image") {
+      totals.imageFiles += 1;
+      totals.estimatedCost += EMBEDDING_PRICING.imageEach;
+      continue;
+    }
+    if (modality === "audio") {
+      totals.audioFiles += 1;
+      let duration = EMBEDDING_PRICING.maxAudioSeconds;
+      try {
+        duration = Math.min(
+          EMBEDDING_PRICING.maxAudioSeconds,
+          await loadMediaDuration(file, "audio")
+        );
+      } catch (err) {
+        totals.warnings.push(`${file.name}: using ${EMBEDDING_PRICING.maxAudioSeconds}s fallback for audio estimate`);
+      }
+      totals.estimatedAudioSeconds += duration;
+      totals.estimatedCost += duration * EMBEDDING_PRICING.audioPerSecond;
+      continue;
+    }
+    if (modality === "video") {
+      totals.videoFiles += 1;
+      let duration = EMBEDDING_PRICING.maxVideoSeconds;
+      try {
+        duration = Math.min(
+          EMBEDDING_PRICING.maxVideoSeconds,
+          await loadMediaDuration(file, "video")
+        );
+      } catch (err) {
+        totals.warnings.push(`${file.name}: using ${EMBEDDING_PRICING.maxVideoSeconds}s fallback for video estimate`);
+      }
+      const billedFrames = duration * EMBEDDING_PRICING.defaultVideoFps;
+      totals.estimatedVideoFrames += billedFrames;
+      totals.estimatedCost += billedFrames * EMBEDDING_PRICING.videoPerFrame;
+    }
+  }
+
+  folderEstimateBusy = false;
+  embedFolderBtn.disabled = false;
+  folderCostEstimate = totals;
+  const bits = [
+    `${formatUsd(totals.estimatedCost)} est.`,
+    `${totals.textFiles} text`,
+    `${totals.imageFiles} image`,
+    `${totals.audioFiles} audio`,
+    `${totals.videoFiles} video`,
+  ];
+  if (totals.skippedFiles) bits.push(`${totals.skippedFiles} skipped`);
+  ingestStatusEl.textContent = bits.join(" · ");
+  return totals;
+}
+
+async function loadSettings() {
+  try {
+    const settings = await fetchJson("/api/settings", { headers: {} });
+    syncSettingsUi(settings);
+  } catch (err) {
+    settingsStatusEl.textContent = String(err.message || err);
+  }
+}
+
+async function saveSettings() {
+  saveSettingsBtn.disabled = true;
+  settingsStatusEl.textContent = "Saving embedding settings…";
+  try {
+    await fetchJson("/api/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        mode: embedModeEl.value,
+        local_model: localModelEl.value,
+        vertex_project: vertexProjectEl.value.trim(),
+        vertex_location: vertexLocationEl.value.trim(),
+        vertex_model: vertexModelEl.value.trim(),
+      }),
+    });
+    settingsStatusEl.textContent = "Embedding settings saved · reloading map…";
+    window.location.reload();
+  } catch (err) {
+    settingsStatusEl.textContent = String(err.message || err);
+  } finally {
+    saveSettingsBtn.disabled = false;
+  }
+}
+
+async function ingestFolderSelection() {
+  const files = Array.from(folderUploadEl.files || []);
+  if (!files.length) {
+    ingestStatusEl.textContent = "Choose a folder first";
+    return;
+  }
+  const estimate = folderCostEstimate || await estimateFolderCost();
+  if (!estimate) return;
+  if (folderEstimateBusy) return;
+  const summaryLines = [
+    `Estimated Gemini Embedding 2 cost: ${formatUsd(estimate.estimatedCost)}`,
+    `${estimate.files} files selected`,
+    `${estimate.textFiles} text · ${estimate.imageFiles} image · ${estimate.audioFiles} audio · ${estimate.videoFiles} video`,
+    `${Math.round(estimate.estimatedTextTokens).toLocaleString()} est. text tokens`,
+    `${estimate.estimatedAudioSeconds.toFixed(1)} billed audio seconds`,
+    `${estimate.estimatedVideoFrames.toFixed(1)} billed video frames`,
+    "",
+    "Assumptions:",
+    `- text estimated from file size at ~${EMBEDDING_PRICING.estimatedCharsPerToken} chars/token`,
+    `- video estimated at default ${EMBEDDING_PRICING.defaultVideoFps} FPS up to ${EMBEDDING_PRICING.maxVideoSeconds}s`,
+    `- audio estimated up to ${EMBEDDING_PRICING.maxAudioSeconds}s`,
+  ];
+  if (estimate.warnings.length) {
+    summaryLines.push("", `Warnings: ${estimate.warnings.slice(0, 3).join(" | ")}`);
+  }
+  summaryLines.push("", "Start embedding this folder?");
+  if (!window.confirm(summaryLines.join("\n"))) {
+    ingestStatusEl.textContent = `Embedding canceled · estimate was ${formatUsd(estimate.estimatedCost)}`;
+    return;
+  }
+  const fd = new FormData();
+  for (const file of files) {
+    fd.append("files", file, file.webkitRelativePath || file.name);
+  }
+  embedFolderBtn.disabled = true;
+  setEmbedBusy(true, "Embedding folder…", `Uploading ${files.length} file${files.length === 1 ? "" : "s"} and generating remote embeddings.`);
+  ingestStatusEl.textContent = `Uploading ${files.length} file${files.length === 1 ? "" : "s"}…`;
+  try {
+    const res = await fetch("/api/ingest-folder", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    ingestStatusEl.textContent = `Embedded ${data.imported} items · reloading map…`;
+    window.location.reload();
+  } catch (err) {
+    ingestStatusEl.textContent = String(err.message || err);
+  } finally {
+    embedFolderBtn.disabled = false;
+    setEmbedBusy(false);
+  }
+}
+
+async function importEmbeddingsFile() {
+  const file = embeddingImportFileEl.files && embeddingImportFileEl.files[0];
+  if (!file) {
+    ingestStatusEl.textContent = "Choose a JSON or JSONL embeddings file first";
+    return;
+  }
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  importEmbeddingsBtn.disabled = true;
+  setEmbedBusy(true, "Importing vectors…", `Reading ${file.name} and folding the vectors into the current map.`);
+  ingestStatusEl.textContent = "Importing vectors…";
+  try {
+    const res = await fetch("/api/import-embeddings", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    ingestStatusEl.textContent = `Imported ${data.imported} vectors · reloading map…`;
+    window.location.reload();
+  } catch (err) {
+    ingestStatusEl.textContent = String(err.message || err);
+  } finally {
+    importEmbeddingsBtn.disabled = false;
+    setEmbedBusy(false);
+  }
 }
 
 function renderSavedPlaylists() {
@@ -2692,6 +3365,7 @@ function renderNeighbors(neighbors) {
 
 function clearQuery() {
   queryPoint = null;
+  queryPoints = [];
   neighborIds = new Set();
   clearQueryBtn.hidden = true;
   neighborBlock.hidden = true;
@@ -2733,6 +3407,19 @@ async function queueNeighborsFromSelection() {
 }
 
 clearQueryBtn.addEventListener("click", clearQuery);
+embedModeEl.addEventListener("change", () => {
+  syncModeFields();
+});
+folderUploadEl.addEventListener("change", () => {
+  estimateFolderCost().catch((err) => {
+    folderEstimateBusy = false;
+    embedFolderBtn.disabled = false;
+    ingestStatusEl.textContent = String(err.message || err);
+  });
+});
+saveSettingsBtn.addEventListener("click", saveSettings);
+embedFolderBtn.addEventListener("click", ingestFolderSelection);
+importEmbeddingsBtn.addEventListener("click", importEmbeddingsFile);
 savePlaylistBtn.addEventListener("click", saveCurrentPlaylist);
 playlistNameEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
@@ -2799,6 +3486,11 @@ async function placeQuery() {
   }
   queryBusy = true;
   queryBtn.disabled = true;
+  setEmbedBusy(
+    true,
+    file ? "Embedding upload…" : "Embedding text…",
+    file ? "Sending your file to the current embedding backend and placing it on the map." : "Turning your text prompt into a point on the map."
+  );
   queryStatus.textContent = file
     ? "Embedding file (model may load on first use)…"
     : "Embedding text (model may load on first use)…";
@@ -2813,7 +3505,9 @@ async function placeQuery() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || res.statusText);
 
+    data.query.id = data.query.id || `query-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     queryPoint = data.query;
+    queryPoints.push(data.query);
     neighborIds = new Set(data.neighbors.map(n => n.id));
     clearQueryBtn.hidden = false;
     renderPanel(queryPoint, "query");
@@ -2827,6 +3521,7 @@ async function placeQuery() {
   } finally {
     queryBusy = false;
     queryBtn.disabled = false;
+    setEmbedBusy(false);
   }
 }
 
@@ -2855,6 +3550,10 @@ function loop() {
 
 window.addEventListener("resize", resize);
 window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !settingsModalEl.hidden) {
+    settingsModalEl.hidden = true;
+    return;
+  }
   if (e.key === "Escape" && !axesModalEl.hidden) {
     axesModalEl.hidden = true;
     return;
@@ -2897,6 +3596,7 @@ updateStats();
 renderPlaylist();
 renderAxesOverlay();
 loadLibrary();
+loadSettings();
 resize();
 draw();
 requestAnimationFrame(loop);
@@ -3042,20 +3742,22 @@ def _send_audio_file(handler: BaseHTTPRequestHandler, path: str) -> None:
     if status == 206:
         handler.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
     handler.end_headers()
-    with open(path, "rb") as f:
-        f.seek(start)
-        remaining = length
-        while remaining > 0:
-            chunk = f.read(min(64 * 1024, remaining))
-            if not chunk:
-                break
-            handler.wfile.write(chunk)
-            remaining -= len(chunk)
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+                remaining -= len(chunk)
+    except (BrokenPipeError, ConnectionResetError):
+        # Browsers often cancel and reopen audio range requests while seeking.
+        return
 
 
-def make_handler(index: MapIndex, html: str, library: LibraryState):
-    by_id = index._by_id
-
+def make_handler(app: MapAppState, html_template: str):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
             path = getattr(self, "path", "")
@@ -3070,10 +3772,40 @@ def make_handler(index: MapIndex, html: str, library: LibraryState):
             self.end_headers()
             self.wfile.write(body)
 
+        def _read_json_body(self) -> Optional[dict[str, Any]]:
+            try:
+                body = _read_request_body(self)
+            except (ValueError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return None
+            try:
+                return json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "Invalid JSON"}, 400)
+                return None
+
+        def _read_multipart_body(self) -> Optional[tuple[dict[str, str], dict[str, list[tuple[str, bytes]]]]]:
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.startswith("multipart/form-data"):
+                self._send_json({"error": "Send multipart form data"}, 415)
+                return None
+            try:
+                body = _read_request_body(self)
+            except (ValueError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return None
+            return _parse_multipart(content_type, body)
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            index = app.index()
+            by_id = index._by_id
             if parsed.path in ("/", "/index.html"):
-                body = html.encode("utf-8")
+                body = (
+                    html_template.replace("__POINTS_JSON__", json.dumps(index.points))
+                    .replace("__PREVIEW_SECONDS__", str(PREVIEW_SECONDS))
+                    .encode("utf-8")
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -3111,7 +3843,11 @@ def make_handler(index: MapIndex, html: str, library: LibraryState):
                 return
 
             if parsed.path == "/api/library":
-                self._send_json(library.snapshot())
+                self._send_json(app.library.snapshot())
+                return
+
+            if parsed.path == "/api/settings":
+                self._send_json(app.current_settings())
                 return
 
             if parsed.path == "/preview":
@@ -3156,26 +3892,28 @@ def make_handler(index: MapIndex, html: str, library: LibraryState):
                     return
                 try:
                     _send_audio_file(self, source)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
                 except Exception as exc:
                     msg = str(exc).encode("utf-8")
-                    self.send_response(500)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.send_header("Content-Length", str(len(msg)))
-                    self.end_headers()
-                    self.wfile.write(msg)
+                    try:
+                        self.send_response(500)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.send_header("Content-Length", str(len(msg)))
+                        self.end_headers()
+                        self.wfile.write(msg)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
                 return
 
             self.send_error(404, "Not found")
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            index = app.index()
             if parsed.path == "/api/axis":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 try:
                     phrase = str(payload.get("text") or "")
@@ -3187,15 +3925,11 @@ def make_handler(index: MapIndex, html: str, library: LibraryState):
                 return
 
             if parsed.path == "/api/library/playlist":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 try:
-                    snapshot = library.save_playlist(
+                    snapshot = app.library.save_playlist(
                         str(payload.get("name") or ""),
                         list(payload.get("ids") or []),
                     )
@@ -3207,30 +3941,22 @@ def make_handler(index: MapIndex, html: str, library: LibraryState):
                 return
 
             if parsed.path == "/api/library/playlist/delete":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 try:
-                    snapshot = library.delete_playlist(str(payload.get("name") or ""))
+                    snapshot = app.library.delete_playlist(str(payload.get("name") or ""))
                     self._send_json(snapshot)
                 except Exception as exc:
                     self._send_json({"error": str(exc)}, 500)
                 return
 
             if parsed.path == "/api/library/tags":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 try:
-                    snapshot = library.set_tags(
+                    snapshot = app.library.set_tags(
                         str(payload.get("id") or ""),
                         list(payload.get("tags") or []),
                     )
@@ -3239,12 +3965,51 @@ def make_handler(index: MapIndex, html: str, library: LibraryState):
                     self._send_json({"error": str(exc)}, 500)
                 return
 
+            if parsed.path == "/api/settings":
+                payload = self._read_json_body()
+                if payload is None:
+                    return
+                try:
+                    self._send_json(app.update_settings(payload))
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if parsed.path == "/api/ingest-folder":
+                multipart = self._read_multipart_body()
+                if multipart is None:
+                    return
+                fields, files = multipart
+                uploaded = files.get("files") or []
+                if not uploaded:
+                    self._send_json({"error": "Choose a folder first"}, 400)
+                    return
+                try:
+                    self._send_json(app.ingest_uploaded_folder(uploaded))
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
+            if parsed.path == "/api/import-embeddings":
+                multipart = self._read_multipart_body()
+                if multipart is None:
+                    return
+                fields, files = multipart
+                uploaded = (files.get("file") or [None])[0]
+                if not uploaded:
+                    self._send_json({"error": "Choose an embeddings file first"}, 400)
+                    return
+                try:
+                    name, payload = uploaded
+                    self._send_json(app.import_embedding_upload(name, payload))
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, 500)
+                return
+
             if parsed.path != "/api/query":
                 self.send_error(404, "Not found")
                 return
 
-            length = int(self.headers.get("Content-Length", "0") or 0)
-            body = self.rfile.read(length) if length else b""
             content_type = self.headers.get("Content-Type", "")
 
             text = ""
@@ -3253,19 +4018,20 @@ def make_handler(index: MapIndex, html: str, library: LibraryState):
             top_k = DEFAULT_NEIGHBORS
 
             if content_type.startswith("application/json"):
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 text = (payload.get("text") or "").strip()
                 top_k = int(payload.get("top_k") or DEFAULT_NEIGHBORS)
             elif content_type.startswith("multipart/form-data"):
-                fields, files = _parse_multipart(content_type, body)
+                multipart = self._read_multipart_body()
+                if multipart is None:
+                    return
+                fields, files = multipart
                 text = (fields.get("text") or "").strip()
                 top_k = int(fields.get("top_k") or DEFAULT_NEIGHBORS)
-                if "file" in files:
-                    upload_name, upload_bytes = files["file"]
+                if files.get("file"):
+                    upload_name, upload_bytes = files["file"][0]
             else:
                 self._send_json({"error": "Send JSON or multipart form data"}, 415)
                 return
@@ -3312,20 +4078,15 @@ def run_server(
     open_browser: bool = True,
     preload_model: bool = False,
 ) -> None:
-    index = MapIndex(db_path, collection)
-    library = LibraryState(str(Path(db_path) / ".anyembed_library.json"))
+    app = MapAppState(db_path, collection)
     if preload_model:
-        index.get_embedder()
-    html = (
-        HTML_PAGE.replace("__POINTS_JSON__", json.dumps(index.points))
-        .replace("__PREVIEW_SECONDS__", str(PREVIEW_SECONDS))
-    )
-    handler = make_handler(index, html, library)
+        app.index().get_embedder()
+    handler = make_handler(app, HTML_PAGE)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     url = f"http://127.0.0.1:{port}/"
     print(f"map ready → {url}", flush=True)
     print(
-        f"{len(index.points)} points · query panel embeds on demand · Ctrl+C to stop",
+        f"{len(app.index().points)} points · query panel embeds on demand · Ctrl+C to stop",
         flush=True,
     )
     if open_browser:

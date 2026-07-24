@@ -8,6 +8,10 @@ qwen-omni-utils             # converts image/audio/video inputs for Qwen2.5-Omni
 pillow
 soundfile
 librosa
+google-genai
+google-auth
+python-dotenv
+requests
 
 # Local vector database
 chromadb>=0.5
