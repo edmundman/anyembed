@@ -24,18 +24,27 @@ so importing this module is cheap and modality detection works without them.
 from __future__ import annotations
 
 import argparse
+import json
 import hashlib
+import mimetypes
 import os
 import time
 from typing import Any, Optional
 
+from dotenv import load_dotenv
+
 # If PyTorch's MPS backend is missing an op, fall back to CPU for that op
 # instead of crashing (must be set before torch is imported).
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+load_dotenv()
 
 MODEL_NAME = "Haon-Chen/e5-omni-7B"
 DEFAULT_DB_PATH = "./anyembed_db"
 DEFAULT_COLLECTION = "anyembed"
+DEFAULT_PROVIDER_MODE = "vertex"
+DEFAULT_VERTEX_MODEL = "gemini-embedding-2"
+DEFAULT_VERTEX_LOCATION = "global"
+DEFAULT_VERTEX_DIMENSION = 3072
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma"}
@@ -52,6 +61,38 @@ DEFAULT_INSTRUCTIONS = {
     "audio": "Represent this audio for retrieving similar content.",
     "video": "Represent this video for retrieving similar content.",
 }
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_provider_mode(explicit: Optional[str] = None) -> str:
+    mode = (explicit or os.getenv("ANYEMBED_EMBEDDER_MODE") or DEFAULT_PROVIDER_MODE).strip().lower()
+    if mode not in {"local", "vertex"}:
+        raise ValueError(f"Unknown embedder mode: {mode}")
+    return mode
+
+
+def default_collection_name(mode: Optional[str] = None) -> str:
+    resolved = get_provider_mode(mode)
+    return f"{DEFAULT_COLLECTION}_{resolved}"
+
+
+def current_embedder_settings(mode: Optional[str] = None) -> dict[str, Any]:
+    resolved = get_provider_mode(mode)
+    return {
+        "mode": resolved,
+        "local_model": os.getenv("ANYEMBED_LOCAL_MODEL") or MODEL_NAME,
+        "vertex_model": os.getenv("ANYEMBED_VERTEX_MODEL") or DEFAULT_VERTEX_MODEL,
+        "vertex_project": (os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip(),
+        "vertex_location": (os.getenv("GOOGLE_CLOUD_LOCATION") or DEFAULT_VERTEX_LOCATION).strip(),
+        "vertex_api_key": (os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY") or "").strip(),
+        "output_dimensionality": int(os.getenv("ANYEMBED_VERTEX_DIMENSION") or DEFAULT_VERTEX_DIMENSION),
+    }
 
 
 def detect_modality(item: Any) -> str:
@@ -118,6 +159,21 @@ def iter_embeddable_files(folder, recursive: bool = True) -> list[str]:
 def _default_id(modality: str, source: str) -> str:
     """Deterministic record id, so re-adding the same item upserts/skips."""
     return hashlib.sha1(f"{modality}:{source}".encode()).hexdigest()[:16]
+
+
+def _hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:24]
+
+
+def _file_content_id(path: str, modality: str) -> str:
+    """Content-based id for local files, so moved/copied duplicates collapse."""
+    if modality == "text":
+        with open(path, "rb") as f:
+            payload = f.read()
+    else:
+        with open(path, "rb") as f:
+            payload = f.read()
+    return _default_id(modality, f"sha256:{_hash_bytes(payload)}")
 
 
 def _resolve_model_dir(model_name: str) -> str:
@@ -279,27 +335,172 @@ class E5OmniEmbedder:
         return embedding.float().cpu().numpy()
 
 
+class VertexAIGeminiEmbedder:
+    """Wraps Gemini Embedding 2 on Vertex AI / Google GenAI."""
+
+    def __init__(
+        self,
+        model_name: Optional[str] = None,
+        project: Optional[str] = None,
+        location: Optional[str] = None,
+        api_key: Optional[str] = None,
+        output_dimensionality: Optional[int] = None,
+    ):
+        from google import genai
+
+        self.model_name = model_name or os.getenv("ANYEMBED_VERTEX_MODEL") or DEFAULT_VERTEX_MODEL
+        self.project = (project or os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip()
+        self.location = (location or os.getenv("GOOGLE_CLOUD_LOCATION") or DEFAULT_VERTEX_LOCATION).strip()
+        self.api_key = (api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY") or "").strip() or None
+        self.output_dimensionality = output_dimensionality or int(
+            os.getenv("ANYEMBED_VERTEX_DIMENSION") or DEFAULT_VERTEX_DIMENSION
+        )
+        if not self.project:
+            raise ValueError(
+                "Vertex mode requires GOOGLE_CLOUD_PROJECT in .env or the environment."
+            )
+        client_kwargs = {
+            "vertexai": True,
+            "project": self.project,
+            "location": self.location,
+        }
+        self.client = genai.Client(**client_kwargs)
+
+    def _part_for_item(self, item: Any, modality: str):
+        from google.genai import types
+
+        if isinstance(item, os.PathLike):
+            item = os.fspath(item)
+        if not isinstance(item, str):
+            raise TypeError("Vertex embedder expects text or a local file path.")
+        if item.startswith(("http://", "https://")):
+            raise ValueError(
+                "Vertex mode currently expects local files for image/audio/video uploads."
+            )
+        with open(item, "rb") as f:
+            data = f.read()
+        mime_type = mimetypes.guess_type(item)[0]
+        if not mime_type:
+            if modality == "image":
+                mime_type = "image/jpeg"
+            elif modality == "audio":
+                mime_type = "audio/mpeg"
+            elif modality == "video":
+                mime_type = "video/mp4"
+            else:
+                mime_type = "application/octet-stream"
+        return types.Part.from_bytes(data=data, mime_type=mime_type)
+
+    def embed(
+        self,
+        item: Any,
+        modality: Optional[str] = None,
+        instruction: Optional[str] = None,
+    ):
+        import numpy as np
+        from google.genai import types
+
+        modality = modality or detect_modality(item)
+        if instruction is None:
+            instruction = DEFAULT_INSTRUCTIONS[modality]
+        if modality == "text":
+            contents: Any = [f"{instruction}\n\n{item}"] if instruction else [str(item)]
+        else:
+            parts = []
+            if instruction:
+                parts.append(types.Part.from_text(text=instruction))
+            parts.append(self._part_for_item(item, modality))
+            contents = [types.Content(role="user", parts=parts)]
+        config = types.EmbedContentConfig(
+            output_dimensionality=self.output_dimensionality
+        )
+        response = self.client.models.embed_content(
+            model=self.model_name,
+            contents=contents,
+            config=config,
+        )
+        values = response.embeddings[0].values
+        vec = np.asarray(values, dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec
+
+
+def build_embedder(mode: Optional[str] = None):
+    resolved = get_provider_mode(mode)
+    if resolved == "local":
+        return E5OmniEmbedder(model_name=os.getenv("ANYEMBED_LOCAL_MODEL") or MODEL_NAME)
+    return VertexAIGeminiEmbedder()
+
+
+def _load_embedding_records(path: str) -> list[dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    if path.lower().endswith(".jsonl"):
+        payload = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    else:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            payload = (
+                parsed.get("records")
+                or parsed.get("items")
+                or parsed.get("embeddings")
+                or []
+            )
+        elif isinstance(parsed, list):
+            payload = parsed
+        else:
+            raise ValueError("Embedding file must contain a list of records")
+    records: list[dict[str, Any]] = []
+    for idx, row in enumerate(payload):
+        if not isinstance(row, dict):
+            raise ValueError(f"Embedding record #{idx + 1} must be an object")
+        embedding = row.get("embedding") or row.get("vector") or row.get("values")
+        if not isinstance(embedding, list) or not embedding:
+            raise ValueError(f"Embedding record #{idx + 1} is missing embedding values")
+        metadata = dict(row.get("metadata") or {})
+        source = row.get("document") or row.get("source") or metadata.get("source") or f"imported-{idx + 1}"
+        modality = row.get("modality") or metadata.get("modality") or "unknown"
+        metadata.setdefault("source", str(source))
+        metadata.setdefault("modality", str(modality))
+        records.append(
+            {
+                "id": str(row.get("id") or _default_id(str(modality), str(source))),
+                "embedding": [float(x) for x in embedding],
+                "document": str(source),
+                "metadata": metadata,
+            }
+        )
+    return records
+
+
 class AnyEmbedDB:
     """A local, persistent vector store (ChromaDB) over an E5OmniEmbedder."""
 
     def __init__(
         self,
         path: str = DEFAULT_DB_PATH,
-        collection: str = DEFAULT_COLLECTION,
-        embedder: Optional[E5OmniEmbedder] = None,
+        collection: Optional[str] = None,
+        embedder: Optional[Any] = None,
+        provider_mode: Optional[str] = None,
     ):
         import chromadb
 
+        self.provider_mode = get_provider_mode(provider_mode)
         self._embedder = embedder
         self.client = chromadb.PersistentClient(path=path)
+        if collection is None:
+            collection = default_collection_name(self.provider_mode)
         self.collection = self.client.get_or_create_collection(
-            collection, metadata={"hnsw:space": "cosine"}
+            collection,
+            metadata={"hnsw:space": "cosine", "provider_mode": self.provider_mode},
         )
 
     @property
-    def embedder(self) -> E5OmniEmbedder:
+    def embedder(self):
         if self._embedder is None:
-            self._embedder = E5OmniEmbedder()
+            self._embedder = build_embedder(self.provider_mode)
         return self._embedder
 
     def add(
@@ -353,12 +554,14 @@ class AnyEmbedDB:
 
         # Record ids are deterministic, so we can compute them without
         # embedding and check the collection for ones that already exist.
+        # For local files, use content fingerprints so moved/copied files
+        # don't get re-embedded under a new path.
         planned_ids = {
-            path: _default_id(
+            path: _file_content_id(
+                path,
                 "text"
                 if os.path.splitext(path)[1].lower() in TEXT_FILE_EXTS
                 else detect_modality(path),
-                path,
             )
             for path in paths
         }
@@ -388,13 +591,16 @@ class AnyEmbedDB:
 
         results: dict[str, str] = {}
         added = skipped = failed = 0
+        seen_this_run: set[str] = set()
         for path in iterator:
-            if planned_ids[path] in existing:
+            if planned_ids[path] in existing or planned_ids[path] in seen_this_run:
                 results[path] = planned_ids[path]
                 skipped += 1
                 continue
             try:
                 file_meta = dict(metadata or {})
+                file_meta["source_path"] = path
+                file_meta["source_hash_id"] = planned_ids[path]
                 if os.path.splitext(path)[1].lower() in TEXT_FILE_EXTS:
                     with open(path, encoding="utf-8", errors="replace") as f:
                         content = f.read()
@@ -403,7 +609,8 @@ class AnyEmbedDB:
                         content, id=planned_ids[path], metadata=file_meta
                     )
                 else:
-                    results[path] = self.add(path, metadata=file_meta)
+                    results[path] = self.add(path, id=planned_ids[path], metadata=file_meta)
+                seen_this_run.add(planned_ids[path])
                 added += 1
             except Exception as exc:
                 failed += 1
@@ -452,6 +659,16 @@ class AnyEmbedDB:
                 }
             )
         return hits
+
+    def import_embeddings_file(self, path: str) -> int:
+        records = _load_embedding_records(path)
+        self.collection.upsert(
+            ids=[row["id"] for row in records],
+            embeddings=[row["embedding"] for row in records],
+            metadatas=[row["metadata"] for row in records],
+            documents=[row["document"] for row in records],
+        )
+        return len(records)
 
 
 _default_db: Optional[AnyEmbedDB] = None

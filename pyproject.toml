@@ -17,6 +17,8 @@ dependencies = [
     "pillow",
     "soundfile",
     "librosa",
+    "google-genai",
+    "python-dotenv",
     "chromadb>=0.5",
     "numpy",
     "textual>=0.80",

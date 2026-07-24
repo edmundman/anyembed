@@ -4,3 +4,5 @@ anyembed_db/
 .venv/
 anyembed.egg-info/
 *.egg-info/
+.env
+.DS_Store

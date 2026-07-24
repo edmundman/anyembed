@@ -7,7 +7,15 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from anyembed import AnyEmbedDB, _default_id, detect_modality, iter_embeddable_files
+from anyembed import (
+    AnyEmbedDB,
+    _default_id,
+    _file_content_id,
+    _load_embedding_records,
+    default_collection_name,
+    detect_modality,
+    iter_embeddable_files,
+)
 
 
 class TestDetectModality(unittest.TestCase):
@@ -132,9 +140,10 @@ class TestAddFolderSkipsExisting(unittest.TestCase):
         self.root = self._dir.name
         self.old = os.path.join(self.root, "old.mp3")
         self.new = os.path.join(self.root, "new.mp3")
-        for p in (self.old, self.new):
-            with open(p, "wb") as f:
-                f.write(b"\x00")
+        with open(self.old, "wb") as f:
+            f.write(b"\x00old")
+        with open(self.new, "wb") as f:
+            f.write(b"\x00new")
 
     def _db(self, existing_ids=()):
         db = AnyEmbedDB.__new__(AnyEmbedDB)
@@ -143,14 +152,14 @@ class TestAddFolderSkipsExisting(unittest.TestCase):
         return db
 
     def test_skips_files_already_in_db(self):
-        db = self._db(existing_ids=[_default_id("audio", self.old)])
+        db = self._db(existing_ids=[_file_content_id(self.old, "audio")])
         results = db.add_folder(self.root)
         # both files are reported as in the DB, but only the new one embedded
         self.assertEqual(set(results), {self.old, self.new})
         self.assertEqual(db._embedder.embedded, [self.new])
 
     def test_force_reembeds_everything(self):
-        db = self._db(existing_ids=[_default_id("audio", self.old)])
+        db = self._db(existing_ids=[_file_content_id(self.old, "audio")])
         db.add_folder(self.root, skip_existing=False)
         self.assertEqual(sorted(db._embedder.embedded), [self.new, self.old])
 
@@ -158,6 +167,49 @@ class TestAddFolderSkipsExisting(unittest.TestCase):
         # resume-after-interrupt relies on ids never changing between runs
         self.assertEqual(_default_id("audio", "/x/a.mp3"), _default_id("audio", "/x/a.mp3"))
         self.assertNotEqual(_default_id("audio", "/x/a.mp3"), _default_id("text", "/x/a.mp3"))
+
+    def test_identical_files_share_same_content_id(self):
+        copy = os.path.join(self.root, "copy.mp3")
+        with open(copy, "wb") as f:
+            f.write(b"\x00old")
+        self.assertEqual(_file_content_id(self.old, "audio"), _file_content_id(copy, "audio"))
+
+    def test_duplicate_content_in_same_folder_embeds_once(self):
+        twin = os.path.join(self.root, "twin.mp3")
+        with open(twin, "wb") as f:
+            f.write(b"\x00old")
+        db = self._db()
+        results = db.add_folder(self.root)
+        self.assertEqual(set(results), {self.old, self.new, twin})
+        self.assertEqual(len(set(results.values())), 2)
+        self.assertEqual(sorted(db._embedder.embedded), [self.new, self.old])
+
+
+class TestProviderHelpers(unittest.TestCase):
+    def test_default_collection_name_changes_by_mode(self):
+        self.assertEqual(default_collection_name("local"), "anyembed_local")
+        self.assertEqual(default_collection_name("vertex"), "anyembed_vertex")
+
+    def test_load_embedding_records_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "vectors.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(
+                    '[{"id":"a1","embedding":[0.1,0.2],"metadata":{"modality":"audio"},"document":"song.mp3"}]'
+                )
+            rows = _load_embedding_records(path)
+            self.assertEqual(rows[0]["id"], "a1")
+            self.assertEqual(rows[0]["document"], "song.mp3")
+            self.assertEqual(rows[0]["metadata"]["modality"], "audio")
+
+    def test_load_embedding_records_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "vectors.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"source":"clip.wav","modality":"audio","embedding":[0.4,0.6]}\n')
+            rows = _load_embedding_records(path)
+            self.assertEqual(rows[0]["document"], "clip.wav")
+            self.assertEqual(rows[0]["metadata"]["source"], "clip.wav")
 
 
 if __name__ == "__main__":
