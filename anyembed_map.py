@@ -42,6 +42,7 @@ DEFAULT_PORT = 8765
 PREVIEW_SECONDS = 16
 PREVIEW_START_FRAC = 0.28
 DEFAULT_NEIGHBORS = 8
+LEGACY_LOCAL_COLLECTION = DEFAULT_COLLECTION
 
 UPLOAD_EXTS = {
     ".jpg",
@@ -447,6 +448,15 @@ class MapAppState:
         self._index: Optional[MapIndex] = None
         self.reload()
 
+    def _collection_names(self) -> set[str]:
+        import chromadb
+
+        client = chromadb.PersistentClient(path=self.db_path)
+        names: set[str] = set()
+        for entry in client.list_collections():
+            names.add(getattr(entry, "name", str(entry)))
+        return names
+
     def current_settings(self) -> dict[str, Any]:
         settings = current_embedder_settings()
         settings["collection"] = self.collection_name(settings["mode"])
@@ -456,7 +466,17 @@ class MapAppState:
 
     def collection_name(self, mode: Optional[str] = None) -> str:
         resolved = get_provider_mode(mode)
-        return self.collection_override or default_collection_name(resolved)
+        if self.collection_override:
+            return self.collection_override
+        preferred = default_collection_name(resolved)
+        if resolved != "local":
+            return preferred
+        names = self._collection_names()
+        if preferred in names:
+            return preferred
+        if LEGACY_LOCAL_COLLECTION in names:
+            return LEGACY_LOCAL_COLLECTION
+        return preferred
 
     def db(self) -> AnyEmbedDB:
         with self._lock:
@@ -485,6 +505,7 @@ class MapAppState:
     def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         updates = {
             "ANYEMBED_EMBEDDER_MODE": get_provider_mode(str(payload.get("mode") or "")),
+            "ANYEMBED_LOCAL_MODEL": str(payload.get("local_model") or "").strip() or "Haon-Chen/e5-omni-7B",
             "GOOGLE_CLOUD_PROJECT": str(payload.get("vertex_project") or "").strip(),
             "GOOGLE_CLOUD_LOCATION": str(payload.get("vertex_location") or DEFAULT_VERTEX_LOCATION).strip(),
             "ANYEMBED_VERTEX_MODEL": str(payload.get("vertex_model") or "").strip() or "gemini-embedding-2",
@@ -518,6 +539,33 @@ class MapAppState:
                 pass
         self.reload()
         return {"imported": count, "point_count": len(self.index().points)}
+
+
+def _read_request_body(handler: BaseHTTPRequestHandler) -> bytes:
+    raw_length = handler.headers.get("Content-Length", "0") or "0"
+    try:
+        length = max(0, int(raw_length))
+    except ValueError as exc:
+        raise ValueError("Invalid Content-Length") from exc
+    if length == 0:
+        return b""
+    chunks = []
+    remaining = length
+    while remaining > 0:
+        try:
+            chunk = handler.rfile.read(min(1024 * 1024, remaining))
+        except OSError as exc:
+            raise OSError(f"Could not read request body: {exc}") from exc
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    body = b"".join(chunks)
+    if len(body) != length:
+        raise OSError(
+            f"Request body truncated ({len(body)} of {length} bytes received)"
+        )
+    return body
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -1296,6 +1344,60 @@ HTML_PAGE = r"""<!DOCTYPE html>
     box-shadow: 0 18px 40px rgba(0,0,0,0.34);
   }
   .info-modal[hidden] { display: none; }
+  .settings-modal {
+    position: fixed;
+    right: 1rem;
+    top: 4.2rem;
+    width: min(420px, calc(100vw - 2rem));
+    z-index: 6;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 1rem;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.03), rgba(0,0,0,0.16)),
+      var(--bg-elev);
+    box-shadow: 0 18px 40px rgba(0,0,0,0.34);
+  }
+  .settings-modal[hidden] { display: none; }
+  .settings-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.6rem;
+    align-items: center;
+    margin-top: 0.7rem;
+  }
+  .settings-grid .label {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.66rem;
+    color: var(--muted);
+  }
+  .settings-grid input,
+  .settings-grid select {
+    width: 100%;
+    min-width: 0;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 10px;
+    padding: 0.5rem 0.65rem;
+    font: 500 0.8rem "Instrument Sans", sans-serif;
+    outline: none;
+  }
+  .settings-grid input:focus,
+  .settings-grid select:focus {
+    border-color: var(--accent-dim);
+  }
+  .settings-actions {
+    display: flex;
+    gap: 0.45rem;
+    margin-top: 0.8rem;
+    flex-wrap: wrap;
+  }
+  .settings-subtle {
+    color: var(--muted);
+    font: 0.66rem "JetBrains Mono", monospace;
+    margin-top: 0.55rem;
+  }
   .axes-modal {
     position: fixed;
     left: 1rem;
@@ -1372,6 +1474,58 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--ink);
     font-weight: 600;
   }
+  .embed-busy {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 4;
+    min-width: min(360px, calc(100vw - 4rem));
+    padding: 1rem 1.1rem;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+    border-radius: 18px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.18)),
+      rgba(18,16,14,0.92);
+    box-shadow: 0 18px 42px rgba(0,0,0,0.36);
+    pointer-events: none;
+  }
+  .embed-busy[hidden] { display: none; }
+  .embed-busy-title {
+    font: 700 0.86rem "Instrument Sans", sans-serif;
+    letter-spacing: -0.01em;
+  }
+  .embed-busy-copy {
+    margin-top: 0.28rem;
+    color: var(--muted);
+    font: 0.72rem "JetBrains Mono", monospace;
+    line-height: 1.5;
+  }
+  .embed-busy-bars {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 0.35rem;
+    margin-top: 0.8rem;
+    align-items: end;
+    height: 26px;
+  }
+  .embed-busy-bars span {
+    display: block;
+    width: 100%;
+    border-radius: 999px;
+    background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 55%, #ffffff 18%));
+    animation: embed-bars 0.9s ease-in-out infinite;
+    transform-origin: bottom center;
+  }
+  .embed-busy-bars span:nth-child(1) { animation-delay: 0s; height: 35%; }
+  .embed-busy-bars span:nth-child(2) { animation-delay: 0.1s; height: 65%; }
+  .embed-busy-bars span:nth-child(3) { animation-delay: 0.2s; height: 100%; }
+  .embed-busy-bars span:nth-child(4) { animation-delay: 0.3s; height: 72%; }
+  .embed-busy-bars span:nth-child(5) { animation-delay: 0.4s; height: 44%; }
+  @keyframes embed-bars {
+    0%, 100% { transform: scaleY(0.45); opacity: 0.55; }
+    50% { transform: scaleY(1); opacity: 1; }
+  }
   .info-grid {
     display: grid;
     grid-template-columns: auto 1fr;
@@ -1425,6 +1579,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
       <label class="tog spin-tog" id="spinLabel"><input type="checkbox" id="spin" /> spin</label>
       <label class="tog"><input type="checkbox" id="audioOnly" checked /> audio only</label>
+      <button type="button" class="toolbar-btn" id="settingsToggle">Settings</button>
       <button type="button" class="toolbar-btn" id="axesToggle">Axes</button>
       <button type="button" class="toolbar-btn icon-btn" id="infoToggle" aria-label="Info">i</button>
       <button type="button" class="toolbar-btn" id="resetView">Reset view</button>
@@ -1435,6 +1590,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <canvas id="stage"></canvas>
     <div id="hint">scroll zoom · drag pan · click play · hover for info</div>
     <div class="axes-overlay" id="axesOverlay"></div>
+    <div class="embed-busy" id="embedBusy" hidden>
+      <div class="embed-busy-title" id="embedBusyTitle">Embedding…</div>
+      <div class="embed-busy-copy" id="embedBusyCopy">Preparing your media for the map.</div>
+      <div class="embed-busy-bars" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+    </div>
   </div>
   <aside id="panel">
     <div class="eyebrow">selection</div>
@@ -1461,25 +1623,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <div class="section">
-      <div class="eyebrow">embedding engine</div>
-      <div class="playlist-save-row">
-        <select id="embedMode">
-          <option value="vertex">Vertex AI</option>
-          <option value="local">Local</option>
-        </select>
-        <button type="button" class="ghost" id="saveSettings">Apply</button>
-      </div>
-      <div class="playlist-save-row" style="margin-top:0.45rem">
-        <input type="text" id="vertexProject" placeholder="Google Cloud project" />
-        <input type="text" id="vertexLocation" placeholder="Location" value="us" />
-      </div>
-      <div class="playlist-save-row" style="margin-top:0.45rem">
-        <input type="text" id="vertexModel" placeholder="Model" value="gemini-embedding-2" />
-      </div>
-      <div class="status-line" id="settingsStatus"></div>
-    </div>
-
-    <div class="section">
       <div class="eyebrow">ingest</div>
       <div class="file-row">
         <input type="file" id="folderUpload" webkitdirectory directory multiple />
@@ -1502,6 +1645,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="playlist-meta" id="libraryStatus">Saved playlists and tags stay local to this DB.</div>
     </div>
   </aside>
+</div>
+<div class="settings-modal" id="settingsModal" hidden>
+  <div class="eyebrow">embedding settings</div>
+  <div class="settings-grid">
+    <span class="label">mode</span>
+    <select id="embedMode">
+      <option value="vertex">Vertex AI</option>
+      <option value="local">Local</option>
+    </select>
+    <span class="label" id="localModelLabel">local model</span>
+    <select id="localModel"></select>
+    <span class="label" id="vertexProjectLabel">project</span>
+    <input type="text" id="vertexProject" placeholder="Google Cloud project" />
+    <span class="label" id="vertexLocationLabel">location</span>
+    <input type="text" id="vertexLocation" placeholder="Location" value="global" />
+    <span class="label" id="vertexModelLabel">vertex model</span>
+    <input type="text" id="vertexModel" placeholder="Model" value="gemini-embedding-2" />
+  </div>
+  <div class="settings-actions">
+    <button type="button" class="action" id="saveSettings">Apply</button>
+    <button type="button" class="ghost" id="closeSettings">Close</button>
+  </div>
+  <div class="settings-subtle" id="settingsStatus"></div>
 </div>
 <div class="axes-modal" id="axesModal" hidden>
   <div class="eyebrow">semantic axes</div>
@@ -1643,6 +1809,9 @@ const spinLabel = document.getElementById("spinLabel");
 const hintEl = document.getElementById("hint");
 const mode2dBtn = document.getElementById("mode2d");
 const mode3dBtn = document.getElementById("mode3d");
+const settingsToggleBtn = document.getElementById("settingsToggle");
+const settingsModalEl = document.getElementById("settingsModal");
+const closeSettingsBtn = document.getElementById("closeSettings");
 const axesToggleBtn = document.getElementById("axesToggle");
 const axesModalEl = document.getElementById("axesModal");
 const axesOverlayEl = document.getElementById("axesOverlay");
@@ -1662,9 +1831,14 @@ const clearQueryBtn = document.getElementById("clearQuery");
 const queryStatus = document.getElementById("queryStatus");
 const fileLabel = document.getElementById("fileLabel");
 const embedModeEl = document.getElementById("embedMode");
+const localModelEl = document.getElementById("localModel");
+const localModelLabelEl = document.getElementById("localModelLabel");
 const vertexProjectEl = document.getElementById("vertexProject");
+const vertexProjectLabelEl = document.getElementById("vertexProjectLabel");
 const vertexLocationEl = document.getElementById("vertexLocation");
+const vertexLocationLabelEl = document.getElementById("vertexLocationLabel");
 const vertexModelEl = document.getElementById("vertexModel");
+const vertexModelLabelEl = document.getElementById("vertexModelLabel");
 const saveSettingsBtn = document.getElementById("saveSettings");
 const settingsStatusEl = document.getElementById("settingsStatus");
 const folderUploadEl = document.getElementById("folderUpload");
@@ -1672,6 +1846,9 @@ const embedFolderBtn = document.getElementById("embedFolderBtn");
 const embeddingImportFileEl = document.getElementById("embeddingImportFile");
 const importEmbeddingsBtn = document.getElementById("importEmbeddingsBtn");
 const ingestStatusEl = document.getElementById("ingestStatus");
+const embedBusyEl = document.getElementById("embedBusy");
+const embedBusyTitleEl = document.getElementById("embedBusyTitle");
+const embedBusyCopyEl = document.getElementById("embedBusyCopy");
 const neighborBlock = document.getElementById("neighborBlock");
 const neighborsEl = document.getElementById("neighbors");
 const queueDrawerEl = document.getElementById("queueDrawer");
@@ -1719,6 +1896,7 @@ let anim = 1;
 let projected = [];
 let needsFrame = true;
 let queryPoint = null; // {title, modality, x,y,x3,y3,z3}
+let queryPoints = [];
 let neighborIds = new Set();
 let queryBusy = false;
 let playlist = [];
@@ -1752,6 +1930,16 @@ const EMBEDDING_PRICING = {
 
 function currentSeedId() {
   return selectedId || playingId || (currentTrack() && currentTrack().id) || null;
+}
+
+function currentQueryPoint() {
+  return queryPoint || (queryPoints.length ? queryPoints[queryPoints.length - 1] : null);
+}
+
+function setEmbedBusy(active, title = "Embedding…", copy = "Preparing your media for the map.") {
+  embedBusyEl.hidden = !active;
+  embedBusyTitleEl.textContent = title;
+  embedBusyCopyEl.textContent = copy;
 }
 
 function setNeighborsPopover(open) {
@@ -1794,9 +1982,22 @@ function renderAxesOverlay() {
 }
 
 function closeTransientPanels({ keep = null } = {}) {
+  if (keep !== "settings") settingsModalEl.hidden = true;
   if (keep !== "axes") axesModalEl.hidden = true;
   if (keep !== "info") infoModalEl.hidden = true;
   if (keep !== "neighbors") setNeighborsPopover(false);
+}
+
+function syncModeFields() {
+  const remote = embedModeEl.value === "vertex";
+  localModelEl.hidden = remote;
+  localModelLabelEl.hidden = remote;
+  vertexProjectEl.hidden = !remote;
+  vertexProjectLabelEl.hidden = !remote;
+  vertexLocationEl.hidden = !remote;
+  vertexLocationLabelEl.hidden = !remote;
+  vertexModelEl.hidden = !remote;
+  vertexModelLabelEl.hidden = !remote;
 }
 
 function visiblePoints() {
@@ -1833,6 +2034,14 @@ function resetView() {
 
 mode2dBtn.addEventListener("click", () => setMode("2d"));
 mode3dBtn.addEventListener("click", () => setMode("3d"));
+settingsToggleBtn.addEventListener("click", () => {
+  const nextOpen = settingsModalEl.hidden;
+  closeTransientPanels({ keep: nextOpen ? "settings" : null });
+  settingsModalEl.hidden = !nextOpen;
+});
+closeSettingsBtn.addEventListener("click", () => {
+  settingsModalEl.hidden = true;
+});
 axesToggleBtn.addEventListener("click", () => {
   const nextOpen = axesModalEl.hidden;
   closeTransientPanels({ keep: nextOpen ? "axes" : null });
@@ -2037,6 +2246,7 @@ function draw() {
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
   const pad = 48;
+  const activeQuery = currentQueryPoint();
   ctx.clearRect(0, 0, w, h);
 
   if (mode === "2d") {
@@ -2063,8 +2273,8 @@ function draw() {
   if (mode === "3d") projected.sort((a, b) => b.depth - a.depth);
 
   // Lines from query to neighbors
-  if (queryPoint) {
-    const qs = projectPoint(queryPoint, w, h, pad);
+  if (activeQuery) {
+    const qs = projectPoint(activeQuery, w, h, pad);
     for (const s of projected) {
       if (!neighborIds.has(s.p.id)) continue;
       ctx.beginPath();
@@ -2107,10 +2317,19 @@ function draw() {
     ctx.globalAlpha = 1;
   }
 
-  if (queryPoint) {
-    const qs = projectPoint(queryPoint, w, h, pad);
-    const pulse = 1 + (playingId ? 0 : Math.sin(performance.now() / 220) * 0.08);
-    drawDiamond(qs.x, qs.y, 8 * pulse * ease, colors.query, "rgba(232,165,75,0.9)");
+  for (const qp of queryPoints) {
+    const qs = projectPoint(qp, w, h, pad);
+    const isActiveQuery = activeQuery && qp.id === activeQuery.id;
+    const pulse = isActiveQuery ? 1 + (playingId ? 0 : Math.sin(performance.now() / 220) * 0.08) : 1;
+    ctx.globalAlpha = isActiveQuery ? 1 : 0.55;
+    drawDiamond(
+      qs.x,
+      qs.y,
+      (isActiveQuery ? 8 : 6) * pulse * ease,
+      colors.query,
+      isActiveQuery ? "rgba(232,165,75,0.9)" : "rgba(242,235,227,0.5)"
+    );
+    ctx.globalAlpha = 1;
   }
 
   if (lassoMode || lassoPoints.length) {
@@ -2122,10 +2341,11 @@ function draw() {
 
 function hitTest(mx, my) {
   // Query diamond first
-  if (queryPoint) {
+  for (let i = queryPoints.length - 1; i >= 0; i -= 1) {
     const w = canvas.clientWidth, h = canvas.clientHeight, pad = 48;
-    const qs = projectPoint(queryPoint, w, h, pad);
-    if (Math.hypot(qs.x - mx, qs.y - my) < 14) return { kind: "query", point: queryPoint };
+    const qp = queryPoints[i];
+    const qs = projectPoint(qp, w, h, pad);
+    if (Math.hypot(qs.x - mx, qs.y - my) < 14) return { kind: "query", point: qp };
   }
   let best = null;
   let bestD = 18;
@@ -2346,14 +2566,19 @@ async function fetchJson(url, options = {}) {
 
 function syncSettingsUi(settings) {
   embedModeEl.value = settings.mode || "vertex";
+  localModelEl.innerHTML = "";
+  for (const model of settings.local_models || []) {
+    const option = document.createElement("option");
+    option.value = model;
+    option.textContent = model;
+    if (model === settings.local_model) option.selected = true;
+    localModelEl.appendChild(option);
+  }
   vertexProjectEl.value = settings.vertex_project || "";
-  vertexLocationEl.value = settings.vertex_location || "us";
+  vertexLocationEl.value = settings.vertex_location || "global";
   vertexModelEl.value = settings.vertex_model || "gemini-embedding-2";
-  const remote = embedModeEl.value === "vertex";
-  vertexProjectEl.disabled = !remote;
-  vertexLocationEl.disabled = !remote;
-  vertexModelEl.disabled = !remote;
-  settingsStatusEl.textContent = remote
+  syncModeFields();
+  settingsStatusEl.textContent = embedModeEl.value === "vertex"
     ? `${settings.api_key_configured ? "API key loaded" : "API key missing"} · collection ${settings.collection || ""}`
     : `Local model ready · collection ${settings.collection || ""}`;
 }
@@ -2502,6 +2727,7 @@ async function saveSettings() {
       method: "POST",
       body: JSON.stringify({
         mode: embedModeEl.value,
+        local_model: localModelEl.value,
         vertex_project: vertexProjectEl.value.trim(),
         vertex_location: vertexLocationEl.value.trim(),
         vertex_model: vertexModelEl.value.trim(),
@@ -2551,6 +2777,7 @@ async function ingestFolderSelection() {
     fd.append("files", file, file.webkitRelativePath || file.name);
   }
   embedFolderBtn.disabled = true;
+  setEmbedBusy(true, "Embedding folder…", `Uploading ${files.length} file${files.length === 1 ? "" : "s"} and generating remote embeddings.`);
   ingestStatusEl.textContent = `Uploading ${files.length} file${files.length === 1 ? "" : "s"}…`;
   try {
     const res = await fetch("/api/ingest-folder", { method: "POST", body: fd });
@@ -2562,6 +2789,7 @@ async function ingestFolderSelection() {
     ingestStatusEl.textContent = String(err.message || err);
   } finally {
     embedFolderBtn.disabled = false;
+    setEmbedBusy(false);
   }
 }
 
@@ -2574,6 +2802,7 @@ async function importEmbeddingsFile() {
   const fd = new FormData();
   fd.append("file", file, file.name);
   importEmbeddingsBtn.disabled = true;
+  setEmbedBusy(true, "Importing vectors…", `Reading ${file.name} and folding the vectors into the current map.`);
   ingestStatusEl.textContent = "Importing vectors…";
   try {
     const res = await fetch("/api/import-embeddings", { method: "POST", body: fd });
@@ -2585,6 +2814,7 @@ async function importEmbeddingsFile() {
     ingestStatusEl.textContent = String(err.message || err);
   } finally {
     importEmbeddingsBtn.disabled = false;
+    setEmbedBusy(false);
   }
 }
 
@@ -3135,6 +3365,7 @@ function renderNeighbors(neighbors) {
 
 function clearQuery() {
   queryPoint = null;
+  queryPoints = [];
   neighborIds = new Set();
   clearQueryBtn.hidden = true;
   neighborBlock.hidden = true;
@@ -3177,10 +3408,7 @@ async function queueNeighborsFromSelection() {
 
 clearQueryBtn.addEventListener("click", clearQuery);
 embedModeEl.addEventListener("change", () => {
-  const remote = embedModeEl.value === "vertex";
-  vertexProjectEl.disabled = !remote;
-  vertexLocationEl.disabled = !remote;
-  vertexModelEl.disabled = !remote;
+  syncModeFields();
 });
 folderUploadEl.addEventListener("change", () => {
   estimateFolderCost().catch((err) => {
@@ -3258,6 +3486,11 @@ async function placeQuery() {
   }
   queryBusy = true;
   queryBtn.disabled = true;
+  setEmbedBusy(
+    true,
+    file ? "Embedding upload…" : "Embedding text…",
+    file ? "Sending your file to the current embedding backend and placing it on the map." : "Turning your text prompt into a point on the map."
+  );
   queryStatus.textContent = file
     ? "Embedding file (model may load on first use)…"
     : "Embedding text (model may load on first use)…";
@@ -3272,7 +3505,9 @@ async function placeQuery() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || res.statusText);
 
+    data.query.id = data.query.id || `query-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     queryPoint = data.query;
+    queryPoints.push(data.query);
     neighborIds = new Set(data.neighbors.map(n => n.id));
     clearQueryBtn.hidden = false;
     renderPanel(queryPoint, "query");
@@ -3286,6 +3521,7 @@ async function placeQuery() {
   } finally {
     queryBusy = false;
     queryBtn.disabled = false;
+    setEmbedBusy(false);
   }
 }
 
@@ -3314,6 +3550,10 @@ function loop() {
 
 window.addEventListener("resize", resize);
 window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !settingsModalEl.hidden) {
+    settingsModalEl.hidden = true;
+    return;
+  }
   if (e.key === "Escape" && !axesModalEl.hidden) {
     axesModalEl.hidden = true;
     return;
@@ -3502,15 +3742,19 @@ def _send_audio_file(handler: BaseHTTPRequestHandler, path: str) -> None:
     if status == 206:
         handler.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
     handler.end_headers()
-    with open(path, "rb") as f:
-        f.seek(start)
-        remaining = length
-        while remaining > 0:
-            chunk = f.read(min(64 * 1024, remaining))
-            if not chunk:
-                break
-            handler.wfile.write(chunk)
-            remaining -= len(chunk)
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+                remaining -= len(chunk)
+    except (BrokenPipeError, ConnectionResetError):
+        # Browsers often cancel and reopen audio range requests while seeking.
+        return
 
 
 def make_handler(app: MapAppState, html_template: str):
@@ -3527,6 +3771,30 @@ def make_handler(app: MapAppState, html_template: str):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _read_json_body(self) -> Optional[dict[str, Any]]:
+            try:
+                body = _read_request_body(self)
+            except (ValueError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return None
+            try:
+                return json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "Invalid JSON"}, 400)
+                return None
+
+        def _read_multipart_body(self) -> Optional[tuple[dict[str, str], dict[str, list[tuple[str, bytes]]]]]:
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.startswith("multipart/form-data"):
+                self._send_json({"error": "Send multipart form data"}, 415)
+                return None
+            try:
+                body = _read_request_body(self)
+            except (ValueError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return None
+            return _parse_multipart(content_type, body)
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
@@ -3624,13 +3892,18 @@ def make_handler(app: MapAppState, html_template: str):
                     return
                 try:
                     _send_audio_file(self, source)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
                 except Exception as exc:
                     msg = str(exc).encode("utf-8")
-                    self.send_response(500)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.send_header("Content-Length", str(len(msg)))
-                    self.end_headers()
-                    self.wfile.write(msg)
+                    try:
+                        self.send_response(500)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.send_header("Content-Length", str(len(msg)))
+                        self.end_headers()
+                        self.wfile.write(msg)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
                 return
 
             self.send_error(404, "Not found")
@@ -3639,12 +3912,8 @@ def make_handler(app: MapAppState, html_template: str):
             parsed = urlparse(self.path)
             index = app.index()
             if parsed.path == "/api/axis":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 try:
                     phrase = str(payload.get("text") or "")
@@ -3656,12 +3925,8 @@ def make_handler(app: MapAppState, html_template: str):
                 return
 
             if parsed.path == "/api/library/playlist":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 try:
                     snapshot = app.library.save_playlist(
@@ -3676,12 +3941,8 @@ def make_handler(app: MapAppState, html_template: str):
                 return
 
             if parsed.path == "/api/library/playlist/delete":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 try:
                     snapshot = app.library.delete_playlist(str(payload.get("name") or ""))
@@ -3691,12 +3952,8 @@ def make_handler(app: MapAppState, html_template: str):
                 return
 
             if parsed.path == "/api/library/tags":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 try:
                     snapshot = app.library.set_tags(
@@ -3709,12 +3966,8 @@ def make_handler(app: MapAppState, html_template: str):
                 return
 
             if parsed.path == "/api/settings":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 try:
                     self._send_json(app.update_settings(payload))
@@ -3723,13 +3976,10 @@ def make_handler(app: MapAppState, html_template: str):
                 return
 
             if parsed.path == "/api/ingest-folder":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                content_type = self.headers.get("Content-Type", "")
-                if not content_type.startswith("multipart/form-data"):
-                    self._send_json({"error": "Send multipart form data"}, 415)
+                multipart = self._read_multipart_body()
+                if multipart is None:
                     return
-                fields, files = _parse_multipart(content_type, body)
+                fields, files = multipart
                 uploaded = files.get("files") or []
                 if not uploaded:
                     self._send_json({"error": "Choose a folder first"}, 400)
@@ -3741,13 +3991,10 @@ def make_handler(app: MapAppState, html_template: str):
                 return
 
             if parsed.path == "/api/import-embeddings":
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = self.rfile.read(length) if length else b""
-                content_type = self.headers.get("Content-Type", "")
-                if not content_type.startswith("multipart/form-data"):
-                    self._send_json({"error": "Send multipart form data"}, 415)
+                multipart = self._read_multipart_body()
+                if multipart is None:
                     return
-                fields, files = _parse_multipart(content_type, body)
+                fields, files = multipart
                 uploaded = (files.get("file") or [None])[0]
                 if not uploaded:
                     self._send_json({"error": "Choose an embeddings file first"}, 400)
@@ -3763,8 +4010,6 @@ def make_handler(app: MapAppState, html_template: str):
                 self.send_error(404, "Not found")
                 return
 
-            length = int(self.headers.get("Content-Length", "0") or 0)
-            body = self.rfile.read(length) if length else b""
             content_type = self.headers.get("Content-Type", "")
 
             text = ""
@@ -3773,15 +4018,16 @@ def make_handler(app: MapAppState, html_template: str):
             top_k = DEFAULT_NEIGHBORS
 
             if content_type.startswith("application/json"):
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except json.JSONDecodeError:
-                    self._send_json({"error": "Invalid JSON"}, 400)
+                payload = self._read_json_body()
+                if payload is None:
                     return
                 text = (payload.get("text") or "").strip()
                 top_k = int(payload.get("top_k") or DEFAULT_NEIGHBORS)
             elif content_type.startswith("multipart/form-data"):
-                fields, files = _parse_multipart(content_type, body)
+                multipart = self._read_multipart_body()
+                if multipart is None:
+                    return
+                fields, files = multipart
                 text = (fields.get("text") or "").strip()
                 top_k = int(fields.get("top_k") or DEFAULT_NEIGHBORS)
                 if files.get("file"):

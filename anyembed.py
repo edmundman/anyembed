@@ -28,7 +28,10 @@ import json
 import hashlib
 import mimetypes
 import os
+import subprocess
+import tempfile
 import time
+import re
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -41,10 +44,14 @@ load_dotenv()
 MODEL_NAME = "Haon-Chen/e5-omni-7B"
 DEFAULT_DB_PATH = "./anyembed_db"
 DEFAULT_COLLECTION = "anyembed"
-DEFAULT_PROVIDER_MODE = "vertex"
+DEFAULT_PROVIDER_MODE = "local"
 DEFAULT_VERTEX_MODEL = "gemini-embedding-2"
 DEFAULT_VERTEX_LOCATION = "global"
 DEFAULT_VERTEX_DIMENSION = 3072
+DEFAULT_VERTEX_STAGING_LOCATION = "US"
+LOCAL_MODEL_OPTIONS = [
+    "Haon-Chen/e5-omni-7B",
+]
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma"}
@@ -84,12 +91,18 @@ def default_collection_name(mode: Optional[str] = None) -> str:
 
 def current_embedder_settings(mode: Optional[str] = None) -> dict[str, Any]:
     resolved = get_provider_mode(mode)
+    local_model = os.getenv("ANYEMBED_LOCAL_MODEL") or MODEL_NAME
+    local_models = list(dict.fromkeys([local_model, *LOCAL_MODEL_OPTIONS]))
+    local_runtime = detect_local_runtime()
     return {
         "mode": resolved,
-        "local_model": os.getenv("ANYEMBED_LOCAL_MODEL") or MODEL_NAME,
+        "local_model": local_model,
+        "local_models": local_models,
+        "local_runtime": local_runtime,
         "vertex_model": os.getenv("ANYEMBED_VERTEX_MODEL") or DEFAULT_VERTEX_MODEL,
         "vertex_project": (os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip(),
         "vertex_location": (os.getenv("GOOGLE_CLOUD_LOCATION") or DEFAULT_VERTEX_LOCATION).strip(),
+        "vertex_staging_bucket": (os.getenv("ANYEMBED_VERTEX_STAGING_BUCKET") or "").strip(),
         "vertex_api_key": (os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY") or "").strip(),
         "output_dimensionality": int(os.getenv("ANYEMBED_VERTEX_DIMENSION") or DEFAULT_VERTEX_DIMENSION),
     }
@@ -165,6 +178,41 @@ def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:24]
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _media_duration_seconds(path: str) -> Optional[float]:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    try:
+        payload = json.loads(result.stdout or "{}")
+        duration = float(payload.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
+
+
 def _file_content_id(path: str, modality: str) -> str:
     """Content-based id for local files, so moved/copied duplicates collapse."""
     if modality == "text":
@@ -190,6 +238,58 @@ def _resolve_model_dir(model_name: str) -> str:
     from huggingface_hub import snapshot_download
 
     return snapshot_download(model_name)
+
+
+def detect_local_runtime() -> dict[str, Any]:
+    runtime: dict[str, Any] = {
+        "device": "cpu",
+        "label": "CPU",
+        "dtype": "float32",
+        "cuda_name": "",
+        "vram_gb": 0,
+        "batch_size": 1,
+        "max_memory": {},
+    }
+    try:
+        import torch
+    except Exception:
+        return runtime
+
+    requested = (os.getenv("ANYEMBED_LOCAL_DEVICE") or "auto").strip().lower()
+    if requested not in {"auto", "cpu", "mps", "cuda", "cuda:0"}:
+        requested = "auto"
+
+    if requested in {"cuda", "cuda:0"} or (
+        requested == "auto" and torch.cuda.is_available()
+    ):
+        index = 0
+        props = torch.cuda.get_device_properties(index)
+        total_gb = max(1, int(props.total_memory / (1024**3)))
+        reserved_gb = 3 if total_gb >= 20 else 2
+        usable_gb = max(4, total_gb - reserved_gb)
+        return {
+            "device": f"cuda:{index}",
+            "label": f"CUDA · {props.name}",
+            "dtype": "float16",
+            "cuda_name": props.name,
+            "vram_gb": total_gb,
+            "batch_size": 1,
+            "max_memory": {index: f"{usable_gb}GiB", "cpu": "64GiB"},
+        }
+
+    mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    if requested == "mps" or (requested == "auto" and mps_available):
+        return {
+            "device": "mps",
+            "label": "Apple Silicon / MPS",
+            "dtype": "float16",
+            "cuda_name": "",
+            "vram_gb": 0,
+            "batch_size": 1,
+            "max_memory": {},
+        }
+
+    return runtime
 
 
 class E5OmniEmbedder:
@@ -228,15 +328,11 @@ class E5OmniEmbedder:
         self.max_audio_seconds = max_audio_seconds
         self.max_image_tokens = max_image_tokens
         self.max_video_frames = max_video_frames
+        runtime = detect_local_runtime()
         if device is None:
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
+            device = runtime["device"]
         if device.startswith("cuda"):
-            dtype = torch.bfloat16
+            dtype = torch.float16
         elif device.startswith("mps"):
             # bfloat16 on MPS is flaky on older macOS/torch; float16 is safe
             dtype = torch.float16
@@ -252,9 +348,16 @@ class E5OmniEmbedder:
         # device; Metal caps single-buffer sizes, so on MPS that fails with
         # "Invalid buffer size". Only use device_map on CUDA — elsewhere load
         # normally and move the model tensor-by-tensor with .to().
-        load_kwargs = {"dtype": dtype, "trust_remote_code": True}
+        load_kwargs = {
+            "dtype": dtype,
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+        }
         if device.startswith("cuda"):
-            load_kwargs["device_map"] = device
+            # Keep a bit of VRAM free for activations and the desktop on 24 GB cards.
+            load_kwargs["device_map"] = "auto"
+            if runtime.get("max_memory"):
+                load_kwargs["max_memory"] = runtime["max_memory"]
         self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
             model_path, **load_kwargs
         )
@@ -355,6 +458,15 @@ class VertexAIGeminiEmbedder:
         self.output_dimensionality = output_dimensionality or int(
             os.getenv("ANYEMBED_VERTEX_DIMENSION") or DEFAULT_VERTEX_DIMENSION
         )
+        self.staging_bucket = (
+            os.getenv("ANYEMBED_VERTEX_STAGING_BUCKET") or self._default_staging_bucket_name(self.project)
+        ).strip()
+        self.staging_location = (
+            os.getenv("ANYEMBED_VERTEX_STAGING_LOCATION") or DEFAULT_VERTEX_STAGING_LOCATION
+        ).strip()
+        self._creds = None
+        self._bucket_ready = False
+        self._project_number = None
         if not self.project:
             raise ValueError(
                 "Vertex mode requires GOOGLE_CLOUD_PROJECT in .env or the environment."
@@ -365,6 +477,233 @@ class VertexAIGeminiEmbedder:
             "location": self.location,
         }
         self.client = genai.Client(**client_kwargs)
+
+    @staticmethod
+    def _default_staging_bucket_name(project: str) -> str:
+        project = re.sub(r"[^a-z0-9-]", "-", (project or "").lower()).strip("-")
+        project = re.sub(r"-{2,}", "-", project)
+        suffix = hashlib.sha1(project.encode("utf-8")).hexdigest()[:8] if project else "default"
+        base = f"anyembed-{project[:32]}-{suffix}"
+        return base[:63].strip("-")
+
+    def _credentials(self):
+        if self._creds is None:
+            import google.auth
+            from google.auth.transport.requests import Request
+
+            creds, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            creds.refresh(Request())
+            self._creds = creds
+        return self._creds
+
+    def _storage_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        expected: tuple[int, ...] = (200,),
+        **kwargs,
+    ):
+        import requests
+
+        creds = self._credentials()
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers["Authorization"] = f"Bearer {creds.token}"
+        response = requests.request(method, url, headers=headers, timeout=120, **kwargs)
+        if response.status_code not in expected:
+            raise RuntimeError(
+                f"Cloud Storage request failed ({response.status_code}): {response.text[:400]}"
+        )
+        return response
+
+    def _get_project_number(self) -> str:
+        if self._project_number is not None:
+            return self._project_number
+        url = f"https://cloudresourcemanager.googleapis.com/v1/projects/{self.project}"
+        response = self._storage_request("GET", url, expected=(200,))
+        payload = response.json()
+        project_number = str(payload.get("projectNumber") or "").strip()
+        if not project_number:
+            raise RuntimeError(f"Could not resolve project number for {self.project}")
+        self._project_number = project_number
+        return project_number
+
+    def _bucket_service_agents(self) -> list[str]:
+        project_number = self._get_project_number()
+        return [
+            f"serviceAccount:service-{project_number}@gcp-sa-aiplatform.iam.gserviceaccount.com",
+            f"serviceAccount:service-{project_number}@gcp-sa-aiplatform-cc.iam.gserviceaccount.com",
+        ]
+
+    def _ensure_bucket_access(self, bucket: str) -> None:
+        import requests
+
+        policy_url = (
+            f"https://storage.googleapis.com/storage/v1/b/{bucket}/iam"
+        )
+        response = self._storage_request("GET", policy_url, expected=(200,))
+        policy = response.json()
+        bindings = list(policy.get("bindings") or [])
+        viewer_role = "roles/storage.objectViewer"
+        binding = next((b for b in bindings if b.get("role") == viewer_role), None)
+        if binding is None:
+            binding = {"role": viewer_role, "members": []}
+            bindings.append(binding)
+        members = set(binding.get("members") or [])
+        auth_header = {"Authorization": f"Bearer {self._credentials().token}"}
+        for member in self._bucket_service_agents():
+            if member in members:
+                continue
+            next_policy = json.loads(json.dumps(policy))
+            next_bindings = list(next_policy.get("bindings") or [])
+            next_binding = next((b for b in next_bindings if b.get("role") == viewer_role), None)
+            if next_binding is None:
+                next_binding = {"role": viewer_role, "members": []}
+                next_bindings.append(next_binding)
+            next_binding["members"] = sorted(set(next_binding.get("members") or []) | {member})
+            next_policy["bindings"] = next_bindings
+            put_response = requests.put(
+                policy_url,
+                headers=auth_header,
+                json=next_policy,
+                timeout=60,
+            )
+            if put_response.status_code == 200:
+                policy = put_response.json()
+                bindings = list(policy.get("bindings") or [])
+                binding = next((b for b in bindings if b.get("role") == viewer_role), binding)
+                members = set(binding.get("members") or [])
+                continue
+            if put_response.status_code == 400 and "does not exist" in put_response.text:
+                continue
+            raise RuntimeError(
+                f"Could not grant Vertex access to bucket {bucket}: {put_response.text[:400]}"
+            )
+
+    def _ensure_staging_bucket(self) -> str:
+        if self._bucket_ready:
+            return self.staging_bucket
+        bucket_url = f"https://storage.googleapis.com/storage/v1/b/{self.staging_bucket}"
+        import requests
+
+        response = requests.get(
+            bucket_url,
+            headers={"Authorization": f"Bearer {self._credentials().token}"},
+            timeout=60,
+        )
+        if response.status_code == 404:
+            create_url = f"https://storage.googleapis.com/storage/v1/b?project={self.project}"
+            payload = {
+                "name": self.staging_bucket,
+                "location": self.staging_location,
+                "iamConfiguration": {"uniformBucketLevelAccess": {"enabled": True}},
+            }
+            self._storage_request("POST", create_url, expected=(200,), json=payload)
+        elif response.status_code != 200:
+            raise RuntimeError(
+                f"Could not inspect Cloud Storage bucket {self.staging_bucket}: {response.text[:400]}"
+            )
+        self._ensure_bucket_access(self.staging_bucket)
+        self._bucket_ready = True
+        return self.staging_bucket
+
+    def _guess_mime_type(self, path: str, modality: str) -> str:
+        mime_type = mimetypes.guess_type(path)[0]
+        if mime_type:
+            return mime_type
+        if modality == "image":
+            return "image/jpeg"
+        if modality == "audio":
+            return "audio/mpeg"
+        if modality == "video":
+            return "video/mp4"
+        return "application/octet-stream"
+
+    def _prepare_audio_file(self, path: str) -> tuple[str, Optional[str]]:
+        duration = _media_duration_seconds(path)
+        if duration is not None and duration <= 180.0:
+            return path, None
+        fd, prepared_path = tempfile.mkstemp(prefix="anyembed-audio-", suffix=".mp3")
+        os.close(fd)
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    path,
+                    "-t",
+                    "180",
+                    "-vn",
+                    "-acodec",
+                    "libmp3lame",
+                    "-b:a",
+                    "192k",
+                    prepared_path,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            os.unlink(prepared_path)
+            raise RuntimeError(
+                "Vertex audio preprocessing requires ffmpeg to be installed."
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            os.unlink(prepared_path)
+            detail = (exc.stderr or exc.stdout or str(exc))[-400:]
+            raise RuntimeError(f"ffmpeg could not prepare audio for Vertex: {detail}") from exc
+        return prepared_path, prepared_path
+
+    def _prepare_media_file(self, path: str, modality: str) -> tuple[str, Optional[str]]:
+        if modality == "audio":
+            return self._prepare_audio_file(path)
+        return path, None
+
+    def _stage_file(self, path: str, modality: str) -> tuple[str, str]:
+        from urllib.parse import quote
+
+        bucket = self._ensure_staging_bucket()
+        prepared_path, cleanup_path = self._prepare_media_file(path, modality)
+        try:
+            digest = _sha256_file(prepared_path)
+            ext = os.path.splitext(prepared_path)[1].lower()
+            object_name = f"vertex-staging/{modality}/{digest}{ext}"
+            object_url = (
+                f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{quote(object_name, safe='')}"
+            )
+            import requests
+
+            response = requests.get(
+                object_url,
+                headers={"Authorization": f"Bearer {self._credentials().token}"},
+                timeout=60,
+            )
+            if response.status_code == 404:
+                upload_url = (
+                    f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o"
+                    f"?uploadType=media&name={quote(object_name, safe='')}"
+                )
+                mime_type = self._guess_mime_type(prepared_path, modality)
+                with open(prepared_path, "rb") as f:
+                    self._storage_request(
+                        "POST",
+                        upload_url,
+                        expected=(200,),
+                        data=f,
+                        headers={"Content-Type": mime_type},
+                    )
+            elif response.status_code != 200:
+                raise RuntimeError(
+                    f"Could not inspect staged object for {path}: {response.text[:400]}"
+                )
+            return f"gs://{bucket}/{object_name}", self._guess_mime_type(prepared_path, modality)
+        finally:
+            if cleanup_path and os.path.exists(cleanup_path):
+                os.unlink(cleanup_path)
 
     def _part_for_item(self, item: Any, modality: str):
         from google.genai import types
@@ -377,19 +716,8 @@ class VertexAIGeminiEmbedder:
             raise ValueError(
                 "Vertex mode currently expects local files for image/audio/video uploads."
             )
-        with open(item, "rb") as f:
-            data = f.read()
-        mime_type = mimetypes.guess_type(item)[0]
-        if not mime_type:
-            if modality == "image":
-                mime_type = "image/jpeg"
-            elif modality == "audio":
-                mime_type = "audio/mpeg"
-            elif modality == "video":
-                mime_type = "video/mp4"
-            else:
-                mime_type = "application/octet-stream"
-        return types.Part.from_bytes(data=data, mime_type=mime_type)
+        file_uri, mime_type = self._stage_file(item, modality)
+        return types.Part.from_uri(file_uri=file_uri, mime_type=mime_type)
 
     def embed(
         self,
@@ -414,11 +742,23 @@ class VertexAIGeminiEmbedder:
         config = types.EmbedContentConfig(
             output_dimensionality=self.output_dimensionality
         )
-        response = self.client.models.embed_content(
-            model=self.model_name,
-            contents=contents,
-            config=config,
-        )
+        last_error = None
+        for attempt in range(4):
+            try:
+                response = self.client.models.embed_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=config,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                message = str(exc)
+                if "Service agents are being provisioned" not in message or attempt == 3:
+                    raise
+                time.sleep(10)
+        else:
+            raise last_error
         values = response.embeddings[0].values
         vec = np.asarray(values, dtype=np.float32)
         norm = np.linalg.norm(vec)

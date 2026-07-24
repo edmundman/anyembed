@@ -9,7 +9,9 @@ pillow
 soundfile
 librosa
 google-genai
+google-auth
 python-dotenv
+requests
 
 # Local vector database
 chromadb>=0.5
